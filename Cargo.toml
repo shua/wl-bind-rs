@@ -1,0 +1,6 @@
+[workspace]
+members = [
+	"wl-bindgen",
+	"wl",
+	"wl-example",
+]
