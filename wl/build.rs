@@ -2,7 +2,6 @@ use std::env;
 use std::fs;
 use std::io::Write;
 use std::path::Path;
-use wl_bindgen;
 
 fn main() -> Result<(), String> {
     let protoc_file =

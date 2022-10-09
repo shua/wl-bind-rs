@@ -19,7 +19,7 @@ fn find_attr<'e>(e: &'e quick_xml::events::BytesStart, name: &str) -> Option<Vec
     find_attr_(e, name).map(|x| x.into_owned())
 }
 fn get_attr<'e>(e: &'e quick_xml::events::BytesStart, name: &str) -> Vec<u8> {
-    find_attr(e, name).expect(&format!("{name} not found"))
+    find_attr(e, name).unwrap_or_else(|| panic!("{name} not found"))
 }
 
 pub enum State {
@@ -43,11 +43,11 @@ pub enum ParseError {
 impl ParseError {
     fn new<S: ?Sized + AsRef<[u8]>>(st: State, expected: &str, got: &S) -> ParseError {
         let mut s = String::new();
-        s.extend("expected ".chars());
-        s.extend(expected.chars());
-        s.extend(", got <".chars());
-        s.extend(str_(got).chars());
-        s.extend(">".chars());
+        s.push_str("expected ");
+        s.push_str(expected);
+        s.push_str(", got <");
+        s.push_str(str_(got));
+        s.push('>');
         ParseError::Unexpected(st, s)
     }
 }

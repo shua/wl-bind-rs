@@ -6,7 +6,7 @@ fn parse_uint(s: &str) -> Result<u32, std::num::ParseIntError> {
     if s.len() > 2 && &s[0..2] == "0x" {
         u32::from_str_radix(&s[2..], 16)
     } else {
-        u32::from_str_radix(s, 10)
+        s.parse::<u32>()
     }
 }
 fn tok_id(s: &str) -> Ident {
@@ -32,7 +32,9 @@ fn to_camelcase(s: &str) -> String {
 
 fn ns_split(s: &[u8]) -> (Option<TokenStream>, &str) {
     let mut parts: Vec<_> = s.split(|&b| b == b'.').map(str_).collect();
-    let last = parts.pop().expect(&format!("nonempty split {}", str_(s)));
+    let last = parts
+        .pop()
+        .unwrap_or_else(|| panic!("nonempty split {}", str_(s)));
     let ns = parts.into_iter().fold(None, |acc, id| {
         let id = tok_id(id);
         match acc {
@@ -65,9 +67,14 @@ fn ty_ident(arg: &Arg, req: bool) -> TokenStream {
                     quote! { #iname }
                 }
             } else {
-                quote! { () }
+                if req {
+                    let gname = tok_id(&to_camelcase(str_(&arg.name)));
+                    quote! { #gname }
+                } else {
+                    quote! { dyn WlHandler }
+                }
             };
-            if !req {
+            if !req || arg.r#type != b"new_id" {
                 iname = quote! { WlRef<#iname> };
             }
             if arg.allow_null {
@@ -89,24 +96,32 @@ fn ty_ident(arg: &Arg, req: bool) -> TokenStream {
     }
 }
 
-fn gen_message(
-    m: &Message,
-    opcodes: &mut Vec<TokenStream>,
-    events: &mut Vec<TokenStream>,
-    requests: &mut Vec<TokenStream>,
-    dsr_cases: &mut Vec<TokenStream>,
-    ser_cases: &mut Vec<TokenStream>,
-    req_fns: &mut Vec<TokenStream>,
-) {
+fn gen_opname(m: &Message, ops: &mut Vec<TokenStream>) -> Ident {
     let opname = tok_id(&str_(&m.name).to_uppercase());
-    let opval = opcodes.len();
-    let opval: u16 = opval
+    let opval: u16 = ops
+        .len()
         .try_into()
-        .expect(&format!("opcodes must fit in u16: {}", str_(&m.name)));
-    opcodes.push(quote! { const #opname : u16 = #opval; });
+        .unwrap_or_else(|_| panic!("opcodes must fit in u16: {}", str_(&m.name)));
+    ops.push(quote! { const #opname : u16 = #opval; });
+    opname
+}
 
-    let name = tok_id(&to_camelcase(str_(&m.name)));
+struct MsgGen {
+    opname: Ident,
+    arg_ty: Vec<TokenStream>,
+    req_gen: Vec<TokenStream>,
+    req_arg_ty: Vec<TokenStream>,
+    req_new_id: Vec<TokenStream>,
+    req_ret_ty: Vec<TokenStream>,
+    req_ret_val: Vec<Ident>,
+    args: Vec<Ident>,
+    ser: Vec<TokenStream>,
+    dsr: Vec<TokenStream>,
+}
+
+fn gen_args(m: &Message, opname: Ident) -> MsgGen {
     let mut arg_ty = Vec::with_capacity(m.args.len());
+    let mut req_gen = Vec::with_capacity(m.args.len());
     let mut req_arg_ty = Vec::with_capacity(m.args.len());
     let mut req_new_id = Vec::with_capacity(m.args.len());
     let mut req_ret_ty = Vec::with_capacity(m.args.len());
@@ -117,37 +132,79 @@ fn gen_message(
 
     for a in &m.args {
         let name = tok_id(str_(&a.name));
-        let ty = ty_ident(&a, false);
-        let req_ty = ty_ident(&a, true);
-        req_arg_ty.push(quote! { #name: #req_ty });
-        arg_ty.push(quote! { #name: #ty });
-        args.push(quote! { #name });
+        let ty = ty_ident(a, false);
+        let req_ty = ty_ident(a, true);
+
         match (a.r#type.as_slice(), a.allow_null) {
             (b"object" | b"new_id", false) => dsr.push(quote! {
-                let (#name, sz): (Option<#ty>, usize) = <Option<#ty> as WlDsr>::dsr(reg, buf, fdbuf).unwrap();
+                let (#name, sz): (Option<#ty>, usize) = <Option<#ty> as WlDsr>::dsr(reg, buf, fdbuf)?;
                 let #name = #name.unwrap();
                 let buf = &mut buf[sz..];
             }),
             _ => dsr.push(quote! {
-                let (#name, sz): (#ty, usize) = <#ty as WlDsr>::dsr(reg, buf, fdbuf).unwrap();
+                let (#name, sz): (#ty, usize) = <#ty as WlDsr>::dsr(reg, buf, fdbuf)?;
                 let buf = &mut buf[sz..];
             })
         }
         ser.push(quote! { #name.ser(buf, fdbuf)?; });
+
+        req_arg_ty.push(quote! { #name: #req_ty });
         if &a.r#type == b"new_id" {
             req_new_id.push(quote! { let #name = cl.new_id(#name); });
-            req_ret_ty.push(ty);
-            req_ret_val.push(name);
+            req_ret_ty.push(ty.clone());
+            req_ret_val.push(name.clone());
         }
+        if matches!(a.r#type.as_slice(), b"new_id" | b"object") && a.interface.is_none() {
+            let gname = tok_id(&to_camelcase(str_(&a.name)));
+            req_gen.push(quote! { #gname : WlHandler });
+            if &a.r#type == b"new_id" {
+                req_new_id.push(quote! { let #name = #name.as_dyn(); });
+            }
+        }
+
+        arg_ty.push(quote! { #name: #ty });
+        args.push(name);
     }
 
+    MsgGen {
+        opname,
+        arg_ty,
+        req_gen,
+        req_arg_ty,
+        req_new_id,
+        req_ret_ty,
+        req_ret_val,
+        args,
+        ser,
+        dsr,
+    }
+}
+
+fn gen_message(
+    m: &Message,
+    opname: Ident,
+    events: &mut Vec<TokenStream>,
+    requests: &mut Vec<TokenStream>,
+    dsr_cases: &mut Vec<TokenStream>,
+    ser_cases: &mut Vec<TokenStream>,
+    req_fns: &mut Vec<TokenStream>,
+) {
+    let name = tok_id(&to_camelcase(str_(&m.name)));
+
+    let MsgGen {
+        opname,
+        arg_ty,
+        req_gen,
+        req_arg_ty,
+        req_new_id,
+        req_ret_ty,
+        req_ret_val,
+        args,
+        ser,
+        dsr,
+    } = gen_args(m, opname);
+
     let desc = str_(&m.description);
-    let fnname = match str_(&m.name) {
-        id @ ("move" | "mut" | "ref" | "box" | "async" | "impl" | "for" | "const") => {
-            Ident::new_raw(id, Span::call_site())
-        }
-        id => tok_id(id),
-    };
     let body = quote! {
         #[doc = #desc]
         #name{ #(#arg_ty),* },
@@ -159,7 +216,7 @@ fn gen_message(
             dsr_cases.push(quote! {
                 OpCode::#opname => {
                     #(#dsr)*
-                    Ok(Event::#name{ #(#args),* })
+                    Ok((Event::#name{ #(#args),* }, sz))
                 }
             })
         }
@@ -167,27 +224,42 @@ fn gen_message(
         MessageVariant::Request => {
             requests.push(body);
             ser_cases.push(quote! {
-                Request::#name{ #(#args),* } => {
-                    buf.extend_from_slice(&[0u8; 4]);
+                Request::#name{ #(ref #args),* } => {
+                    buf.extend([0u8; 4]);
                     let i = buf.len();
                     #(#ser)*
                     let j = buf.len();
-                    let sz_u = ((j - i) & 0xffff);
-                    let sz : usize = sz_u.try_into().unwrap();
-                    let opsz = (u32::from(OpCode::#opname) << 16) | sz;
-                    buf[i-4..i].copy_from_slice(&opsz.to_be_bytes());
-                    Ok(sz_u)
+                    let sz : u32 = ((j - i) & 0xffff).try_into().unwrap();
+                    let sz = sz + 8;
+                    let szop = (sz << 16) | u32::from(OpCode::#opname);
+                    buf[i-4..i].copy_from_slice(&szop.to_ne_bytes());
+                    Ok(())
                 }
             });
+            let fnname = match str_(&m.name) {
+                id @ ("fn" | "static" | "union" | "struct" | "move" | "mut" | "ref" | "const"
+                | "box" | "async" | "await" | "impl" | "trait" | "dyn" | "for" | "in"
+                | "let") => Ident::new_raw(id, Span::call_site()),
+                id => tok_id(id),
+            };
+            let fngen = if req_gen.is_empty() {
+                quote! {}
+            } else {
+                quote! { <#(#req_gen),*> }
+            };
             req_fns.push(quote! {
                 #[doc = #desc]
-                pub fn #fnname(
+                pub fn #fnname #fngen (
                     &self,
                     cl: &mut WlClient
                     #(,#req_arg_ty)*
-                ) -> Result<(#(#req_ret_ty),*), ()> {
+                ) -> Result<(#(#req_ret_ty),*), WlSerError> {
                     #(#req_new_id)*
-                    todo!("actually call cl.send with something");
+                    let req = Request::#name{ #(#args),* };
+                    if matches!(std::env::var("WAYLAND_DEBUG").as_ref().map(String::as_str), Ok("1")) {
+                        println!("[{}] -> {req:?}", timestamp());
+                    }
+                    cl.send(*self, req);
                     Ok((#(#req_ret_val),*))
                 }
             });
@@ -219,15 +291,13 @@ fn gen_enum(n: &Enum, enms: &mut Vec<TokenStream>) {
 
     let dsr_ser = quote! {
         impl WlDsr for #name {
-            type Error = <u32 as WlDsr>::Error;
-            fn dsr(reg: &ObjectRegistry, buf: &mut [u8], fdbuf: &mut Vec<RawFd>) -> Result<(Self, usize), Self::Error> {
+            fn dsr(reg: &ObjectRegistry, buf: &mut [u8], fdbuf: &mut Vec<RawFd>) -> Result<(Self, usize), WlDsrError> {
                 let (n, sz) = u32::dsr(reg, buf, fdbuf)?;
                 Ok((n.try_into().unwrap(), sz))
             }
         }
         impl WlSer for #name {
-            type Error = <u32 as WlSer>::Error;
-            fn ser(&self, buf: &mut Vec<u8>, fdbuf: &mut Vec<RawFd>) -> Result<(), Self::Error> {
+            fn ser(&self, buf: &mut Vec<u8>, fdbuf: &mut Vec<RawFd>) -> Result<(), WlSerError> {
                 let n : u32 = (*self).into();
                 n.ser(buf, fdbuf)
             }
@@ -275,9 +345,11 @@ fn gen_enum(n: &Enum, enms: &mut Vec<TokenStream>) {
 pub fn generate(p: &Protocol) -> TokenStream {
     let Protocol { interfaces, .. } = p;
     let mut ifaces: Vec<TokenStream> = Vec::with_capacity(interfaces.len());
+    let mut globals: Vec<TokenStream> = Vec::with_capacity(interfaces.len());
 
     for Interface {
         name,
+        version,
         description,
         messages,
         enums,
@@ -288,17 +360,27 @@ pub fn generate(p: &Protocol) -> TokenStream {
         let iobjname = tok_id(&to_camelcase(name));
         let nameid = tok_id(name);
         let idoc = str_(&description);
+        let version: u32 = str_(&version).parse().unwrap();
+        globals.push(quote! { (0, #name, #version, std::any::TypeId::of::<#nameid::Object>()) });
 
-        let mut opcodes: Vec<TokenStream> = Vec::with_capacity(messages.len());
+        let mut vops: Vec<TokenStream> = Vec::with_capacity(messages.len());
+        let mut rops: Vec<TokenStream> = Vec::with_capacity(messages.len());
+
         let mut events: Vec<TokenStream> = Vec::with_capacity(messages.len());
         let mut requests: Vec<TokenStream> = Vec::with_capacity(messages.len());
         let mut dsr_cases: Vec<TokenStream> = Vec::with_capacity(messages.len());
         let mut ser_cases: Vec<TokenStream> = Vec::with_capacity(messages.len());
         let mut req_fns: Vec<TokenStream> = Vec::with_capacity(messages.len());
         for m in messages {
+            use MessageVariant::*;
+            let opname = match m.var {
+                Event => gen_opname(m, &mut vops),
+                Request => gen_opname(m, &mut rops),
+            };
+
             gen_message(
                 m,
-                &mut opcodes,
+                opname,
                 &mut events,
                 &mut requests,
                 &mut dsr_cases,
@@ -320,15 +402,24 @@ pub fn generate(p: &Protocol) -> TokenStream {
                 #(#enms)*
                 #[derive(Debug)]
                 pub enum Event { #(#events)* }
+                #[derive(Debug)]
                 pub enum Request { #(#requests)* }
 
                 struct OpCode;
                 impl OpCode {
-                    #(#opcodes)*
+                    #(#vops)*
+                    #(#rops)*
                 }
 
+                type EventHandler = Box<dyn Fn(&ObjectRegistry, Event) -> Result<(), WlHandleError>>;
                 pub struct Object{
-                    pub on_event: Option<Box<dyn Fn(&ObjectRegistry, Event) -> Result<(), WlHandleError>>>,
+                    pub on_event: Option<EventHandler>,
+                }
+
+                impl Object {
+                    pub fn new(on_event: impl Fn(&ObjectRegistry, Event) -> Result<(), WlHandleError> + 'static) -> Object {
+                        Object{ on_event: Some(Box::new(on_event)) }
+                    }
                 }
 
                 impl std::fmt::Debug for WlRef<Object> {
@@ -339,46 +430,61 @@ pub fn generate(p: &Protocol) -> TokenStream {
 
                 impl WlHandler for Object {
                     fn handle(&self, reg: &ObjectRegistry, op: u16, buf: &mut [u8], fdbuf: &mut Vec<RawFd>) -> Result<(), WlHandleError> {
-                        let event = match op {
-                            #(#dsr_cases)*
-                            _ => Err(WlHandleError::UnrecognizedOpcode(op)),
-                        }?;
+                        let (event, _) = Event::dsr(reg, buf, fdbuf).map_err(WlHandleError::Deser)?;
                         if matches!(std::env::var("WAYLAND_DEBUG").as_ref().map(String::as_str), Ok("1")) {
-                            println!("ts {event:?}");
+                            println!("[{}] <- {event:?}", timestamp());
                         }
                         match &self.on_event {
                             Some(cb) => cb(reg, event),
                             None => Err(WlHandleError::Unhandled),
                         }
                     }
+
                     fn type_id(&self) -> std::any::TypeId {
                         std::any::TypeId::of::<Object>()
                     }
                 }
 
-                impl WlRef<Object> {
-                    #(#req_fns)*
+                impl WlRef<Object> { #(#req_fns)* }
+
+                impl WlDsr for Event {
+                    fn dsr(
+                        reg: &ObjectRegistry,
+                        buf: &mut [u8],
+                        fdbuf: &mut Vec<RawFd>,
+                    ) -> Result<(Self, usize), WlDsrError> {
+                        let szop = u32::from_ne_bytes(buf[4..8].try_into().unwrap());
+                        let op : u16 = (szop & 0xffff).try_into().unwrap();
+                        let sz : usize = (szop >> 16).try_into().unwrap();
+                        let buf = &mut buf[8..];
+                        match op {
+                            #(#dsr_cases)*
+                            _ => Err(WlDsrError::UnrecognizedOpcode(op)),
+                        }
+                    }
                 }
 
-                impl Request {
-                    fn ser_request(
+                impl WlSer for Request {
+                    fn ser(
                         &self,
                         buf: &mut Vec<u8>,
                         fdbuf: &mut Vec<RawFd>
-                    ) -> Result<usize, WlPrimitiveSerError> {
-                        match self {
+                    ) -> Result<(), WlSerError> {
+                        match *self {
                             #(#ser_cases)*
-                            _ => unreachable!("unless you're doing weird stuff with unsafe refs https://github.com/rust-lang/rust/issues/78123"),
                         }
                     }
                 }
             }
-            pub use #nameid::Object as #iobjname;
+            pub type #iobjname = #nameid::Object;
         });
     }
 
+    let globals_len = globals.len();
     quote! {
         #(#ifaces)*
+
+        pub fn globals() -> [(u32, &'static str, u32, std::any::TypeId); #globals_len] { [#(#globals),*] }
     }
 }
 
@@ -394,7 +500,7 @@ fn generate_dumb(p: Protocol) {
                 "event  "
             };
             print!("    {} {} {}(", var_s, mi, str_(&m.name));
-            if m.args.len() > 0 {
+            if !m.args.is_empty() {
                 fn ptype(a: &Arg) {
                     match (a.r#type.as_slice(), &a.interface, &a.r#enum) {
                         (b"new_id", Some(i), _) => print!("new id {}", str_(i)),
@@ -410,7 +516,7 @@ fn generate_dumb(p: Protocol) {
                 parg(&m.args[0]);
                 for a in m.args[1..].iter() {
                     print!(", ");
-                    parg(&a);
+                    parg(a);
                 }
             }
             println!(")");
