@@ -12,21 +12,42 @@ use std::sync::{Once, RwLock};
 mod sockio;
 
 pub struct ObjectRegistry {
-    bound: RefCell<Vec<Option<Box<dyn WlHandler>>>>,
+    bound: RefCell<Vec<RefCell<Option<Box<dyn WlHandler>>>>>,
+    new_ids: RefCell<Vec<Option<Box<dyn WlHandler>>>>,
     globals: RefCell<Vec<(u32, &'static str, u32, std::any::TypeId)>>,
 }
 
 impl ObjectRegistry {
     pub fn new(display: WlDisplay) -> ObjectRegistry {
         ObjectRegistry {
-            bound: RefCell::new(vec![None, Some(Box::new(display))]),
+            bound: RefCell::new(vec![RefCell::new(Some(Box::new(display)))]),
+            new_ids: RefCell::new(vec![]),
             globals: RefCell::new(globals().to_vec()),
+        }
+    }
+
+    fn print_ids(&self) {
+        println!(
+            "ids: {}: {:?}",
+            self.bound.borrow().len(),
+            self.bound
+                .borrow()
+                .iter()
+                .map(|c| c.borrow().is_some())
+                .collect::<Vec<_>>(),
+        );
+    }
+
+    pub fn update_ids(&mut self) {
+        let new_ids = std::mem::replace(self.new_ids.get_mut(), vec![]);
+        for h in new_ids.into_iter() {
+            self.bound.get_mut().push(RefCell::new(h));
         }
     }
 
     pub fn get_mut<T: WlHandler>(&mut self, r: WlRef<T>) -> Option<&mut T> {
         let id: usize = r.id.try_into().unwrap();
-        let dyn_h = &mut **self.bound.get_mut().get_mut(id)?.as_mut()?;
+        let dyn_h = &mut **self.bound.get_mut().get_mut(id - 1)?.get_mut().as_mut()?;
         // basically copying dyn Any impl
         if dyn_h.is::<T>() {
             // SAFETY: we just checked this is the correct type
@@ -37,18 +58,23 @@ impl ObjectRegistry {
     }
 
     pub fn new_id<T: WlHandler>(&self, init: T) -> WlRef<T> {
-        let mut hs = self.bound.borrow_mut();
-        if let Some((i, v)) = hs[1..].iter_mut().enumerate().find(|(_, v)| v.is_none()) {
-            v.replace(Box::new(init));
-            return WlRef {
-                id: i.try_into().unwrap(),
+        let mut hs = self.bound.borrow();
+        if let Some((i, v)) = hs.iter().enumerate().find(|(_, v)| (*v).borrow().is_none()) {
+            let i = i + 1;
+            v.borrow_mut().replace(Box::new(init));
+            let r = WlRef {
+                id: (i + 1).try_into().unwrap(),
                 marker: PhantomData,
             };
+            return r;
         }
+
         let i = hs.len();
+        let mut hs = self.new_ids.borrow_mut();
+        let i = i + hs.len();
         hs.push(Some(Box::new(init)));
         WlRef {
-            id: i.try_into().unwrap(),
+            id: (i + 1).try_into().unwrap(),
             marker: PhantomData,
         }
     }
@@ -71,12 +97,17 @@ impl ObjectRegistry {
     }
 
     fn destroy(&self, id: u32) -> bool {
-        let mut hs = self.bound.borrow_mut();
+        let mut hs = self.bound.borrow();
         let id: usize = id.try_into().unwrap();
-        match hs.get_mut(id) {
-            Some(v @ Some(_)) => {
-                v.take();
-                true
+        match hs.get(id - 1) {
+            Some(v) => {
+                let mut v = v.borrow_mut();
+                if v.is_some() {
+                    v.take();
+                    true
+                } else {
+                    false
+                }
             }
             _ => false,
         }
@@ -85,11 +116,14 @@ impl ObjectRegistry {
     fn make_ref<T: 'static + ?Sized>(&self, id: u32) -> Option<WlRef<T>> {
         let id_u: usize = id.try_into().unwrap();
         let hs = self.bound.borrow();
-        let mut dyn_h = hs.get(id_u).and_then(Option::as_ref);
-        if dyn_h.is_none() {
-            eprintln!("handlers[{id}] not initialized");
-        }
-        let dyn_h = dyn_h?;
+        let mut dyn_h = match hs.get(id_u).map(RefCell::borrow) {
+            Some(r) => r,
+            None => {
+                eprintln!("handlers[{id}] not initialized");
+                return None;
+            }
+        };
+        let dyn_h = dyn_h.as_ref()?;
         let ttid = std::any::TypeId::of::<T>();
         let concrete = (&**dyn_h).type_id();
         if ttid == std::any::TypeId::of::<dyn WlHandler>() || concrete == ttid {
@@ -271,7 +305,7 @@ impl WlClient {
         self.buf.truncate(0);
         self.buf.extend(r.id.to_ne_bytes());
         req.ser(&mut self.buf, &mut self.fdbuf)?;
-        println!("{:?}", self.buf);
+        self.handlers.update_ids();
         let n = sockio::sendmsg(&mut self.sock, &self.buf, &self.fdbuf);
         self.buf.truncate(0);
         self.fdbuf.truncate(0);
@@ -288,8 +322,8 @@ impl WlClient {
         const HDR_SZ: usize = WORD_SZ * 2;
         let buf_len = self.buf.len();
         let fdbuf_len = self.fdbuf.len();
-        let (bufn, fdbufn) = sockio::recvmsg(&mut self.sock, &mut self.buf, &mut self.fdbuf)?;
 
+        let (bufn, fdbufn) = sockio::recvmsg(&mut self.sock, &mut self.buf, &mut self.fdbuf)?;
         if bufn == 0 && fdbufn == 0 {
             return Ok(None);
         }
@@ -311,20 +345,18 @@ impl WlClient {
             i += sz;
 
             let objid: usize = usize::try_from(id).unwrap();
-            let obj = {
-                let hborrow = self.handlers.bound.borrow();
-                let obj = hborrow.get(objid).and_then(Option::as_ref);
-                match obj {
-                    Some(obj) => obj,
-                    None => {
-                        eprintln!("message for non-existent object (@{id})");
-                        continue;
-                    }
+            let hborrow = self.handlers.bound.borrow();
+            let obj = hborrow.get(objid - 1).map(RefCell::borrow);
+            let obj = match obj {
+                Some(obj) if obj.is_some() => obj,
+                _ => {
+                    eprintln!("message for non-existent object (@{id})");
+                    continue;
                 }
             };
+            let obj = obj.as_ref().unwrap();
 
             let buf = &mut buf[..sz];
-            println!("{:?}", buf);
             obj.handle(&self.handlers, op, buf, &mut self.fdbuf)
                 .map_err(|e| eprintln!("handle err: {e:?}"))?;
         }
@@ -332,6 +364,7 @@ impl WlClient {
         // move unhandled bytes to front of buf, truncate
         self.buf.copy_within(i.., 0);
         self.buf.truncate(self.buf.len() - i);
+        self.handlers.update_ids();
 
         Ok(Some(()))
     }
