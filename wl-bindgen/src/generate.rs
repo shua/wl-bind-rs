@@ -71,7 +71,7 @@ fn ty_ident(arg: &Arg, req: bool) -> TokenStream {
                     let gname = tok_id(&to_camelcase(str_(&arg.name)));
                     quote! { #gname }
                 } else {
-                    quote! { dyn WlHandler }
+                    quote! { dyn Interface }
                 }
             };
             if !req || arg.r#type != b"new_id" {
@@ -106,27 +106,58 @@ fn gen_opname(m: &Message, ops: &mut Vec<TokenStream>) -> Ident {
     opname
 }
 
+struct ArgTys {
+    arg: Vec<Ident>,
+    ty: Vec<TokenStream>,
+    gen: Vec<Ident>,
+    gen_constraints: Vec<TokenStream>,
+}
+
+impl ArgTys {
+    fn new() -> ArgTys {
+        ArgTys {
+            arg: vec![],
+            ty: vec![],
+            gen: vec![],
+            gen_constraints: vec![],
+        }
+    }
+
+    fn push(&mut self, arg: Ident, ty: TokenStream) {
+        self.arg.push(arg);
+        self.ty.push(ty);
+    }
+}
+
+impl quote::ToTokens for ArgTys {
+    fn to_tokens(&self, tokens: &mut TokenStream) {
+        use quote::TokenStreamExt;
+        for i in 0..self.arg.len() {
+            tokens.append(self.arg[i].clone());
+            tokens.append(proc_macro2::Punct::new(':', proc_macro2::Spacing::Alone));
+            tokens.append_all(self.ty[i].clone());
+            if i != self.arg.len() {
+                tokens.append(proc_macro2::Punct::new(',', proc_macro2::Spacing::Alone));
+            }
+        }
+    }
+}
+
 struct MsgGen {
     opname: Ident,
-    arg_ty: Vec<TokenStream>,
-    req_gen: Vec<TokenStream>,
-    req_arg_ty: Vec<TokenStream>,
+    arg_ty: ArgTys,
+    req_arg_ty: ArgTys,
     req_new_id: Vec<TokenStream>,
-    req_ret_ty: Vec<TokenStream>,
-    req_ret_val: Vec<Ident>,
-    args: Vec<Ident>,
+    req_ret_arg_ty: ArgTys,
     ser: Vec<TokenStream>,
     dsr: Vec<TokenStream>,
 }
 
 fn gen_args(m: &Message, opname: Ident) -> MsgGen {
-    let mut arg_ty = Vec::with_capacity(m.args.len());
-    let mut req_gen = Vec::with_capacity(m.args.len());
-    let mut req_arg_ty = Vec::with_capacity(m.args.len());
+    let mut arg_ty = ArgTys::new();
+    let mut req_arg_ty = ArgTys::new();
     let mut req_new_id = Vec::with_capacity(m.args.len());
-    let mut req_ret_ty = Vec::with_capacity(m.args.len());
-    let mut req_ret_val = Vec::with_capacity(m.args.len());
-    let mut args = Vec::with_capacity(m.args.len());
+    let mut req_ret_arg_ty = ArgTys::new();
     let mut ser = Vec::with_capacity(m.args.len());
     let mut dsr = Vec::with_capacity(m.args.len());
 
@@ -146,35 +177,48 @@ fn gen_args(m: &Message, opname: Ident) -> MsgGen {
                 let buf = &mut buf[sz..];
             })
         }
-        ser.push(quote! { #name.ser(buf, fdbuf)?; });
 
-        req_arg_ty.push(quote! { #name: #req_ty });
+        if a.r#type.as_slice() == b"new_id" && a.interface.is_none() {
+            ser.push(quote! { interface.ser(buf, fdbuf)?; });
+            ser.push(quote! { version.ser(buf, fdbuf)?; });
+        }
+        ser.push(quote! { #name.ser(buf, fdbuf)?; });
+        req_arg_ty.push(name.clone(), req_ty.clone());
         if &a.r#type == b"new_id" {
             req_new_id.push(quote! { let #name = cl.new_id(#name); });
-            req_ret_ty.push(ty.clone());
-            req_ret_val.push(name.clone());
+            req_ret_arg_ty.push(name.clone(), ty.clone());
         }
         if matches!(a.r#type.as_slice(), b"new_id" | b"object") && a.interface.is_none() {
             let gname = tok_id(&to_camelcase(str_(&a.name)));
-            req_gen.push(quote! { #gname : WlHandler });
+            req_arg_ty
+                .gen_constraints
+                .push(quote! { #gname : Interface });
             if &a.r#type == b"new_id" {
+                req_new_id
+                    .push(quote! { let interface : WlStr = <WlRef<#gname> as InterfaceDesc>::NAME.into(); });
+                req_new_id
+                    .push(quote! { let version = <WlRef<#gname> as InterfaceDesc>::VERSION; });
                 req_new_id.push(quote! { let #name = #name.as_dyn(); });
+                req_arg_ty
+                    .gen_constraints
+                    .push(quote! { WlRef<#gname>: InterfaceDesc });
             }
+            req_arg_ty.gen.push(gname);
         }
 
-        arg_ty.push(quote! { #name: #ty });
-        args.push(name);
+        if a.r#type.as_slice() == b"new_id" && a.interface.is_none() {
+            arg_ty.push(tok_id("interface"), quote! {  WlStr });
+            arg_ty.push(tok_id("version"), quote! { u32 });
+        }
+        arg_ty.push(name, ty);
     }
 
     MsgGen {
         opname,
         arg_ty,
-        req_gen,
         req_arg_ty,
         req_new_id,
-        req_ret_ty,
-        req_ret_val,
-        args,
+        req_ret_arg_ty,
         ser,
         dsr,
     }
@@ -194,20 +238,18 @@ fn gen_message(
     let MsgGen {
         opname,
         arg_ty,
-        req_gen,
         req_arg_ty,
         req_new_id,
-        req_ret_ty,
-        req_ret_val,
-        args,
+        req_ret_arg_ty,
         ser,
         dsr,
     } = gen_args(m, opname);
 
     let desc = str_(&m.description);
+    let args = &arg_ty.arg;
     let body = quote! {
         #[doc = #desc]
-        #name{ #(#arg_ty),* },
+        #name{ #arg_ty },
     };
 
     match m.var {
@@ -236,24 +278,32 @@ fn gen_message(
                     Ok(())
                 }
             });
+
             let fnname = match str_(&m.name) {
                 id @ ("fn" | "static" | "union" | "struct" | "move" | "mut" | "ref" | "const"
                 | "box" | "async" | "await" | "impl" | "trait" | "dyn" | "for" | "in"
                 | "let") => Ident::new_raw(id, Span::call_site()),
                 id => tok_id(id),
             };
-            let fngen = if req_gen.is_empty() {
-                quote! {}
+            let (fngen, fnwhere) = if req_arg_ty.gen.is_empty() {
+                (quote! {}, quote! {})
             } else {
-                quote! { <#(#req_gen),*> }
+                let req_gen = req_arg_ty.gen.clone();
+                let req_where = req_arg_ty.gen_constraints.clone();
+                (quote! { <#(#req_gen),*> }, quote! { where #(#req_where),* })
             };
+
+            let req_ret_val = &req_ret_arg_ty.arg;
+            let req_ret_ty = &req_ret_arg_ty.ty;
             req_fns.push(quote! {
                 #[doc = #desc]
                 pub fn #fnname #fngen (
                     &self,
-                    cl: &mut WlClient
-                    #(,#req_arg_ty)*
-                ) -> Result<(#(#req_ret_ty),*), WlSerError> {
+                    cl: &mut WlClient,
+                    #req_arg_ty
+                ) -> Result<(#(#req_ret_ty),*), WlSerError>
+                    #fnwhere
+                {
                     #(#req_new_id)*
                     let req = Request::#name{ #(#args),* };
                     if matches!(std::env::var("WAYLAND_DEBUG").as_ref().map(String::as_str), Ok("1")) {
@@ -345,7 +395,6 @@ fn gen_enum(n: &Enum, enms: &mut Vec<TokenStream>) {
 pub fn generate(p: &Protocol) -> TokenStream {
     let Protocol { interfaces, .. } = p;
     let mut ifaces: Vec<TokenStream> = Vec::with_capacity(interfaces.len());
-    let mut globals: Vec<TokenStream> = Vec::with_capacity(interfaces.len());
 
     for Interface {
         name,
@@ -361,7 +410,6 @@ pub fn generate(p: &Protocol) -> TokenStream {
         let nameid = tok_id(name);
         let idoc = str_(&description);
         let version: u32 = str_(&version).parse().unwrap();
-        globals.push(quote! { (0, #name, #version, std::any::TypeId::of::<#nameid::Object>()) });
 
         let mut vops: Vec<TokenStream> = Vec::with_capacity(messages.len());
         let mut rops: Vec<TokenStream> = Vec::with_capacity(messages.len());
@@ -394,6 +442,7 @@ pub fn generate(p: &Protocol) -> TokenStream {
             gen_enum(n, &mut enms);
         }
 
+        let name_null = format!("{}\0", name);
         ifaces.push(quote! {
             #[doc = #idoc]
             pub mod #nameid {
@@ -412,23 +461,29 @@ pub fn generate(p: &Protocol) -> TokenStream {
                 }
 
                 type EventHandler = Box<dyn Fn(&ObjectRegistry, Event) -> Result<(), WlHandleError>>;
-                pub struct Object{
+                pub struct Proxy {
                     pub on_event: Option<EventHandler>,
                 }
 
-                impl Object {
-                    pub fn new(on_event: impl Fn(&ObjectRegistry, Event) -> Result<(), WlHandleError> + 'static) -> Object {
-                        Object{ on_event: Some(Box::new(on_event)) }
+                impl Proxy {
+                    pub fn new(on_event: impl Fn(&ObjectRegistry, Event) -> Result<(), WlHandleError> + 'static) -> Proxy {
+                        Proxy{ on_event: Some(Box::new(on_event)) }
                     }
+
                 }
 
-                impl std::fmt::Debug for WlRef<Object> {
+                impl std::fmt::Debug for WlRef<Proxy> {
                     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                         write!(f, "{}@{}", #name, self.id)
                     }
                 }
 
-                impl WlHandler for Object {
+                impl InterfaceDesc for WlRef<Proxy> {
+                    const NAME: &'static std::ffi::CStr = unsafe { std::ffi::CStr::from_bytes_with_nul_unchecked(#name_null.as_bytes()) };
+                    const VERSION: u32 = #version;
+                }
+
+                impl Interface for Proxy {
                     fn handle(&self, reg: &ObjectRegistry, op: u16, buf: &mut [u8], fdbuf: &mut Vec<RawFd>) -> Result<(), WlHandleError> {
                         let (event, _) = Event::dsr(reg, buf, fdbuf).map_err(WlHandleError::Deser)?;
                         if matches!(std::env::var("WAYLAND_DEBUG").as_ref().map(String::as_str), Ok("1")) {
@@ -441,11 +496,11 @@ pub fn generate(p: &Protocol) -> TokenStream {
                     }
 
                     fn type_id(&self) -> std::any::TypeId {
-                        std::any::TypeId::of::<Object>()
+                        std::any::TypeId::of::<Proxy>()
                     }
                 }
 
-                impl WlRef<Object> { #(#req_fns)* }
+                impl WlRef<Proxy> { #(#req_fns)* }
 
                 impl WlDsr for Event {
                     fn dsr(
@@ -476,15 +531,12 @@ pub fn generate(p: &Protocol) -> TokenStream {
                     }
                 }
             }
-            pub type #iobjname = #nameid::Object;
+            pub type #iobjname = #nameid::Proxy;
         });
     }
 
-    let globals_len = globals.len();
     quote! {
         #(#ifaces)*
-
-        pub fn globals() -> [(u32, &'static str, u32, std::any::TypeId); #globals_len] { [#(#globals),*] }
     }
 }
 

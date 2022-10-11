@@ -12,9 +12,9 @@ use std::sync::{Once, RwLock};
 mod sockio;
 
 pub struct ObjectRegistry {
-    bound: RefCell<Vec<RefCell<Option<Box<dyn WlHandler>>>>>,
-    new_ids: RefCell<Vec<Option<Box<dyn WlHandler>>>>,
-    globals: RefCell<Vec<(u32, &'static str, u32, std::any::TypeId)>>,
+    bound: RefCell<Vec<RefCell<Option<Box<dyn Interface>>>>>,
+    new_ids: RefCell<Vec<Box<dyn Interface>>>,
+    globals: RefCell<Vec<(u32, WlStr, u32)>>,
 }
 
 impl ObjectRegistry {
@@ -22,45 +22,45 @@ impl ObjectRegistry {
         ObjectRegistry {
             bound: RefCell::new(vec![RefCell::new(Some(Box::new(display)))]),
             new_ids: RefCell::new(vec![]),
-            globals: RefCell::new(globals().to_vec()),
+            globals: RefCell::new(vec![]),
         }
     }
 
     fn print_ids(&self) {
         println!(
-            "ids: {}: {:?}",
+            "ids: {}: {:?} (+{})",
             self.bound.borrow().len(),
             self.bound
                 .borrow()
                 .iter()
                 .map(|c| c.borrow().is_some())
                 .collect::<Vec<_>>(),
+            self.new_ids.borrow().len(),
         );
     }
 
-    pub fn update_ids(&mut self) {
+    fn update_ids(&mut self) {
         let new_ids = std::mem::replace(self.new_ids.get_mut(), vec![]);
         for h in new_ids.into_iter() {
-            self.bound.get_mut().push(RefCell::new(h));
+            self.bound.get_mut().push(RefCell::new(Some(h)));
         }
     }
 
-    pub fn get_mut<T: WlHandler>(&mut self, r: WlRef<T>) -> Option<&mut T> {
+    pub fn get_mut<T: Interface>(&mut self, r: WlRef<T>) -> Option<&mut T> {
         let id: usize = r.id.try_into().unwrap();
         let dyn_h = &mut **self.bound.get_mut().get_mut(id - 1)?.get_mut().as_mut()?;
         // basically copying dyn Any impl
         if dyn_h.is::<T>() {
             // SAFETY: we just checked this is the correct type
-            Some(unsafe { &mut *(dyn_h as *mut dyn WlHandler as *mut T) })
+            Some(unsafe { &mut *(dyn_h as *mut dyn Interface as *mut T) })
         } else {
             None
         }
     }
 
-    pub fn new_id<T: WlHandler>(&self, init: T) -> WlRef<T> {
+    pub fn new_id<T: Interface>(&self, init: T) -> WlRef<T> {
         let mut hs = self.bound.borrow();
         if let Some((i, v)) = hs.iter().enumerate().find(|(_, v)| (*v).borrow().is_none()) {
-            let i = i + 1;
             v.borrow_mut().replace(Box::new(init));
             let r = WlRef {
                 id: (i + 1).try_into().unwrap(),
@@ -72,7 +72,7 @@ impl ObjectRegistry {
         let i = hs.len();
         let mut hs = self.new_ids.borrow_mut();
         let i = i + hs.len();
-        hs.push(Some(Box::new(init)));
+        hs.push(Box::new(init));
         WlRef {
             id: (i + 1).try_into().unwrap(),
             marker: PhantomData,
@@ -83,16 +83,18 @@ impl ObjectRegistry {
         let mut globals = self.globals.borrow_mut();
         if let Some(v) = globals
             .iter_mut()
-            .find(|(_, i, v, _)| i.as_bytes() == interface.to_bytes() && *v == version)
+            .find(|(_, i, v)| i.as_bytes() == interface.to_bytes() && *v == version)
         {
             v.0 = name;
+        } else {
+            globals.push((name, interface, version));
         }
     }
 
     pub fn global_remove(&self, name: u32) {
         let mut globals = self.globals.borrow_mut();
-        if let Some(v) = globals.iter_mut().find(|(n, _, _, _)| *n == name) {
-            v.0 = 0;
+        if let Some((i, _)) = globals.iter().enumerate().find(|(_, (n, _, _))| *n == name) {
+            globals.remove(i);
         }
     }
 
@@ -126,7 +128,7 @@ impl ObjectRegistry {
         let dyn_h = dyn_h.as_ref()?;
         let ttid = std::any::TypeId::of::<T>();
         let concrete = (&**dyn_h).type_id();
-        if ttid == std::any::TypeId::of::<dyn WlHandler>() || concrete == ttid {
+        if ttid == std::any::TypeId::of::<dyn Interface>() || concrete == ttid {
             let marker = PhantomData;
             Some(WlRef { id, marker })
         } else {
@@ -170,7 +172,7 @@ impl WlClient {
 
     fn print_error(
         _: &ObjectRegistry,
-        object_id: WlRef<dyn WlHandler>,
+        object_id: WlRef<dyn Interface>,
         code: u32,
         message: WlStr,
     ) -> Result<(), WlHandleError> {
@@ -183,7 +185,7 @@ impl WlClient {
 
     pub fn on_error<CB>(&mut self, cb: CB)
     where
-        CB: Fn(&ObjectRegistry, WlRef<dyn WlHandler>, u32, WlStr) -> Result<(), WlHandleError>
+        CB: Fn(&ObjectRegistry, WlRef<dyn Interface>, u32, WlStr) -> Result<(), WlHandleError>
             + 'static,
     {
         let disp = self.display;
@@ -253,38 +255,43 @@ impl WlClient {
         Ok(c)
     }
 
-    pub fn bind_global<T: WlHandler>(&mut self, global: T) -> Result<WlRef<T>, WlSerError> {
+    pub fn bind_global<T: Interface>(&mut self, global: T) -> Result<WlRef<T>, WlSerError>
+    where
+        WlRef<T>: InterfaceDesc,
+    {
         let name = {
-            let gtid = std::any::TypeId::of::<T>();
+            let name = &<WlRef<T> as InterfaceDesc>::NAME;
+            let version = <WlRef<T> as InterfaceDesc>::VERSION;
             let globals = self.handlers.globals.borrow();
-            if let Some((n, _, _, _)) = globals.iter().find(|(_, _, _, tid)| *tid == gtid) {
+
+            if let Some((n, _, _)) = globals
+                .iter()
+                .find(|(_, i, v)| i.as_c_str() == *name && *v == version)
+            {
                 *n
             } else {
-                0
+                return Err(WlSerError::BindWrongType);
             }
         };
-        if name != 0 {
-            let registry = self.registry;
-            let rdyn = registry.bind(self, name, global)?;
-            Ok(WlRef {
-                id: rdyn.id,
-                marker: PhantomData,
-            })
-        } else {
-            Err(WlSerError::BindWrongType)
-        }
+
+        let registry = self.registry;
+        let rdyn = registry.bind(self, name, global)?;
+        Ok(WlRef {
+            id: rdyn.id,
+            marker: PhantomData,
+        })
     }
 
-    pub fn describe_globals(&self) -> Vec<(&'static str, u32)> {
+    pub fn describe_globals(&self) -> Vec<(String, u32)> {
         let globals = self.handlers.globals.borrow();
         globals
             .iter()
-            .filter(|(n, _, _, _)| *n != 0)
-            .map(|(_, i, v, _)| (*i, *v))
+            .filter(|(n, _, _)| *n != 0)
+            .map(|(_, i, v)| (i.to_str().unwrap().to_string(), *v))
             .collect()
     }
 
-    pub fn get_mut<T: WlHandler>(&mut self, r: WlRef<T>) -> Option<&mut T> {
+    pub fn get_mut<T: Interface>(&mut self, r: WlRef<T>) -> Option<&mut T> {
         // we control the display
         if r.id != 1 {
             self.handlers.get_mut(r)
@@ -293,11 +300,11 @@ impl WlClient {
         }
     }
 
-    pub fn new_id<T: WlHandler>(&mut self, init: T) -> WlRef<T> {
+    pub fn new_id<T: Interface>(&mut self, init: T) -> WlRef<T> {
         self.handlers.new_id(init)
     }
 
-    fn send<T: WlHandler>(
+    fn send<T: Interface>(
         &mut self,
         r: WlRef<T>,
         req: impl WlSer + 'static,
@@ -315,6 +322,13 @@ impl WlClient {
             panic!("buffer underwrite");
         }
         Ok(())
+    }
+
+    fn print_buf_u32(buf: &[u8]) {
+        for c in buf.chunks(4) {
+            print!("{:08x} ", u32::from_ne_bytes(c.try_into().unwrap()));
+        }
+        println!();
     }
 
     pub fn poll(&mut self) -> Result<Option<()>, ()> {
@@ -385,14 +399,14 @@ impl<T: ?Sized> Clone for WlRef<T> {
 }
 impl<T: ?Sized> Copy for WlRef<T> {}
 
-impl std::fmt::Debug for WlRef<dyn WlHandler> {
+impl std::fmt::Debug for WlRef<dyn Interface> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "object@{}", self.id)
     }
 }
 
-impl<T: WlHandler> WlRef<T> {
-    fn as_dyn(self) -> WlRef<dyn WlHandler> {
+impl<T: Interface> WlRef<T> {
+    fn as_dyn(self) -> WlRef<dyn Interface> {
         WlRef {
             id: self.id,
             marker: PhantomData,
@@ -508,7 +522,12 @@ macro_rules! delegate_op {
 }
 delegate_op! { WlFixed Neg::neg() Add::add(rhs) Sub::sub(rhs) }
 
-pub trait WlHandler: 'static {
+pub trait InterfaceDesc {
+    const NAME: &'static std::ffi::CStr;
+    const VERSION: u32;
+}
+
+pub trait Interface: 'static {
     fn handle(
         &self,
         reg: &ObjectRegistry,
@@ -516,30 +535,15 @@ pub trait WlHandler: 'static {
         buf: &mut [u8],
         fds: &mut Vec<RawFd>,
     ) -> Result<(), WlHandleError>;
+
     fn type_id(&self) -> std::any::TypeId;
 }
 
-impl dyn WlHandler {
-    fn is<T: WlHandler>(&self) -> bool {
+impl dyn Interface {
+    fn is<T: Interface>(&self) -> bool {
         let concrete = self.type_id();
         let ttid = std::any::TypeId::of::<T>();
         concrete == ttid
-    }
-}
-
-impl WlHandler for () {
-    fn handle(
-        &self,
-        reg: &ObjectRegistry,
-        op: u16,
-        buf: &mut [u8],
-        fds: &mut Vec<RawFd>,
-    ) -> Result<(), WlHandleError> {
-        panic!("this should only be a placeholder in the object registry, which should not exist across polls")
-    }
-
-    fn type_id(&self) -> std::any::TypeId {
-        std::any::TypeId::of::<()>()
     }
 }
 
@@ -630,6 +634,17 @@ impl WlDsr for WlFd {
     }
 }
 
+impl<T: 'static + ?Sized> WlDsr for WlRef<T> {
+    fn dsr(
+        reg: &ObjectRegistry,
+        buf: &mut [u8],
+        fdbuf: &mut Vec<RawFd>,
+    ) -> Result<(Self, usize), WlDsrError> {
+        let (id, sz) = u32::dsr(reg, buf, fdbuf)?;
+        Ok((reg.make_ref(id).expect("null ref"), sz))
+    }
+}
+
 impl<T: 'static + ?Sized> WlDsr for Option<WlRef<T>> {
     fn dsr(
         reg: &ObjectRegistry,
@@ -678,21 +693,28 @@ impl_ser! { u32 }
 impl_ser! { i32 }
 impl_ser! { WlFixed }
 
+fn ser_bytes(bs: &[u8], buf: &mut Vec<u8>, fdbuf: &mut Vec<RawFd>) -> Result<(), WlSerError> {
+    let sz: u32 = bs.len().try_into().unwrap();
+    sz.ser(buf, fdbuf)?;
+    buf.extend_from_slice(bs);
+    if buf.len() % 4 != 0 {
+        for i in 0..(4 - buf.len() % 4) {
+            buf.push(0);
+        }
+    }
+    Ok(())
+}
+
 impl WlSer for WlArray {
     fn ser(&self, buf: &mut Vec<u8>, fdbuf: &mut Vec<RawFd>) -> Result<(), WlSerError> {
-        let sz: u32 = self.len().try_into().unwrap();
-        sz.ser(buf, fdbuf)?;
-        buf.extend_from_slice(self);
-        Ok(())
+        ser_bytes(self.as_slice(), buf, fdbuf)
     }
 }
 
 impl WlSer for WlStr {
     fn ser(&self, buf: &mut Vec<u8>, fdbuf: &mut Vec<RawFd>) -> Result<(), WlSerError> {
-        let sz: u32 = self.as_bytes().len().try_into().unwrap();
-        sz.ser(buf, fdbuf)?;
-        buf.extend_from_slice(self.as_bytes());
-        Ok(())
+        let s = self.as_bytes_with_nul();
+        ser_bytes(s, buf, fdbuf)
     }
 }
 
