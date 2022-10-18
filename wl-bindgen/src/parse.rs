@@ -25,6 +25,7 @@ fn get_attr<'e>(e: &'e quick_xml::events::BytesStart, name: &str) -> Vec<u8> {
 pub enum State {
     Start,
     Protocol(Protocol),
+    ProtocolDescription(Protocol),
     Copyright(Protocol),
     Interface(Protocol, Interface),
     InterfaceDescription(Protocol, Interface),
@@ -32,6 +33,8 @@ pub enum State {
     MessageDescription(Protocol, Interface, Message),
     Enum(Protocol, Interface, Enum),
     EnumDescription(Protocol, Interface, Enum),
+    EnumEntry(Protocol, Interface, Enum, Entry),
+    EnumEntryDescription(Protocol, Interface, Enum, Entry),
 }
 
 #[derive(Debug)]
@@ -69,6 +72,7 @@ impl Debug for State {
                 str_(&p.name),
                 p.interfaces.last().map(|i| str_(&i.name)).unwrap_or("*")
             ),
+            ProtocolDescription(p) => write!(f, "Protocol({}:description)", str_(&p.name),),
             Copyright(p) => write!(f, "Protocol({}:copyright)", str_(&p.name)),
             Interface(p, i) => write!(
                 f,
@@ -114,6 +118,22 @@ impl Debug for State {
                 str_(&i.name),
                 str_(&n.name),
             ),
+            EnumEntry(p, i, n, e) => write!(
+                f,
+                "EnumEntry({}:{}:{}:{})",
+                str_(&p.name),
+                str_(&i.name),
+                str_(&n.name),
+                str_(&e.name),
+            ),
+            EnumEntryDescription(p, i, n, e) => write!(
+                f,
+                "EnumEntyr({}:{}:{}:{}:description)",
+                str_(&p.name),
+                str_(&i.name),
+                str_(&n.name),
+                str_(&e.name),
+            ),
         }
     }
 }
@@ -141,9 +161,9 @@ pub fn parse(xml: &[u8]) -> Result<Protocol, ParseError> {
     }
 
     use State::{
-        Copyright as SC, Enum as SN, EnumDescription as SND, Interface as SI,
-        InterfaceDescription as SID, Message as SM, MessageDescription as SMD, Protocol as SP,
-        Start as SS,
+        Copyright as SC, Enum as SN, EnumDescription as SND, EnumEntry as SNE,
+        EnumEntryDescription as SNED, Interface as SI, InterfaceDescription as SID, Message as SM,
+        MessageDescription as SMD, Protocol as SP, ProtocolDescription as SPD, Start as SS,
     };
     use XEvent::{Empty, End, Eof, Start, Text};
 
@@ -177,7 +197,30 @@ pub fn parse(xml: &[u8]) -> Result<Protocol, ParseError> {
                         ..Default::default()
                     },
                 ),
-                _ => perr!(SP(p), "<copyright>, <interface>", e.name()),
+                b"description" => SPD(p),
+                _ => perr!(
+                    SP(p),
+                    "<copyright>, <interface>, or <description>",
+                    e.name()
+                ),
+            },
+            (SP(mut p), Empty(e)) => match e.name().as_ref() {
+                b"description" => {
+                    p.description.extend(get_attr(&e, "summary"));
+                    SP(p)
+                }
+                _ => perr!(SP(p), "<description/>", e.name()),
+            },
+            (SPD(mut p), Text(txt)) => {
+                for txt in txt.as_ref().split(|&b| b == b'\n') {
+                    p.description.extend(trim_txt(txt));
+                    p.description.push(b'\n');
+                }
+                SPD(p)
+            }
+            (SPD(p), End(e)) => match e.name().as_ref() {
+                b"description" => SP(p),
+                _ => perr!(SPD(p), "</description>", e.name()),
             },
 
             (SC(mut p), Text(txt)) => {
@@ -195,7 +238,29 @@ pub fn parse(xml: &[u8]) -> Result<Protocol, ParseError> {
                     i.description.extend(get_attr(&e, "summary"));
                     SI(p, i)
                 }
-                _ => perr!(SI(p, i), "<description/>", e.name()),
+                b"request" => {
+                    i.messages.push(Message {
+                        name: get_attr(&e, "name"),
+                        var: MessageVariant::Request,
+                        description: vec![],
+                        args: vec![],
+                    });
+                    SI(p, i)
+                }
+                b"event" => {
+                    i.messages.push(Message {
+                        name: get_attr(&e, "name"),
+                        var: MessageVariant::Event,
+                        description: vec![],
+                        args: vec![],
+                    });
+                    SI(p, i)
+                }
+                _ => perr!(
+                    SI(p, i),
+                    "<description/>, <request/>, or <event/>",
+                    e.name()
+                ),
             },
             (SI(p, i), Start(e)) => {
                 use MessageVariant::{self as MV, Event as MVE, Request as MVR};
@@ -306,6 +371,17 @@ pub fn parse(xml: &[u8]) -> Result<Protocol, ParseError> {
 
             (SN(p, i, n), Start(e)) => match e.name().as_ref() {
                 b"description" => SND(p, i, n),
+                b"entry" => SNE(
+                    p,
+                    i,
+                    n,
+                    Entry {
+                        name: get_attr(&e, "name"),
+                        value: get_attr(&e, "value"),
+                        summary: find_attr(&e, "summary"),
+                        description: vec![],
+                    },
+                ),
                 _ => perr!(SN(p, i, n), "<description>", e.name()),
             },
             (SN(p, i, mut n), Empty(e)) => match e.name().as_ref() {
@@ -318,6 +394,7 @@ pub fn parse(xml: &[u8]) -> Result<Protocol, ParseError> {
                         name: get_attr(&e, "name"),
                         value: get_attr(&e, "value"),
                         summary: find_attr(&e, "summary"),
+                        description: vec![],
                     });
                     SN(p, i, n)
                 }
@@ -341,6 +418,29 @@ pub fn parse(xml: &[u8]) -> Result<Protocol, ParseError> {
                     SI(p, i)
                 }
                 _ => perr!(SN(p, i, n), "</entry>, or </enum>", e.name()),
+            },
+
+            (SNE(p, i, n, entry), Start(e)) => match e.name().as_ref() {
+                b"description" => SNED(p, i, n, entry),
+                _ => perr!(SNE(p, i, n, entry), "<description>", e.name()),
+            },
+            (SNED(p, i, n, mut e), Text(txt)) => {
+                for txt in txt.as_ref().split(|&b| b == b'\n') {
+                    e.description.extend(trim_txt(txt));
+                    e.description.push(b'\n');
+                }
+                SNED(p, i, n, e)
+            }
+            (SNED(p, i, n, entry), End(e)) => match e.name().as_ref() {
+                b"description" => SNE(p, i, n, entry),
+                _ => perr!(SNED(p, i, n, entry), "</description>", e.name()),
+            },
+            (SNE(p, i, mut n, entry), End(e)) => match e.name().as_ref() {
+                b"entry" => {
+                    n.entries.push(entry);
+                    SN(p, i, n)
+                }
+                _ => perr!(SNE(p, i, n, entry), "</entry>", e.name()),
             },
 
             (SI(mut p, i), End(e)) => match e.name().as_ref() {

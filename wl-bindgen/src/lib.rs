@@ -3,7 +3,7 @@ use proc_macro2::TokenStream;
 mod parse;
 pub use parse::parse;
 mod generate;
-pub use generate::generate;
+pub use generate::{generate, GenOptions};
 
 fn str_<'s, S: ?Sized + AsRef<[u8]> + 's>(bs: &'s S) -> &'s str {
     unsafe { std::str::from_utf8_unchecked(bs.as_ref()) }
@@ -11,17 +11,18 @@ fn str_<'s, S: ?Sized + AsRef<[u8]> + 's>(bs: &'s S) -> &'s str {
 
 #[derive(Default)]
 pub struct Protocol {
-    name: Vec<u8>,
-    copyright: Vec<u8>,
-    interfaces: Vec<Interface>,
+    pub name: Vec<u8>,
+    pub copyright: Vec<u8>,
+    pub interfaces: Vec<Interface>,
+    pub description: Vec<u8>,
 }
 #[derive(Default)]
 pub struct Interface {
-    name: Vec<u8>,
-    version: Vec<u8>,
-    description: Vec<u8>,
-    messages: Vec<Message>,
-    enums: Vec<Enum>,
+    pub name: Vec<u8>,
+    pub version: Vec<u8>,
+    pub description: Vec<u8>,
+    pub messages: Vec<Message>,
+    pub enums: Vec<Enum>,
 }
 #[derive(Default)]
 pub struct Arg {
@@ -55,11 +56,19 @@ pub struct Entry {
     name: Vec<u8>,
     value: Vec<u8>,
     summary: Option<Vec<u8>>,
+    description: Vec<u8>,
 }
 
 pub fn gen_bindings<R: std::io::Read>(mut r: R) -> Result<TokenStream, parse::ParseError> {
     let mut buf = Vec::new();
     r.read_to_end(&mut buf).unwrap();
     let protoc = parse(buf.as_slice())?;
-    Ok(generate(&protoc))
+    let reused = vec![];
+    Ok(generate(
+        &protoc,
+        generate::GenOptions {
+            reused: &reused,
+            ..std::default::Default::default()
+        },
+    ))
 }

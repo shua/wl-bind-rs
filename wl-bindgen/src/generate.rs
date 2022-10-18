@@ -161,19 +161,28 @@ fn gen_args(m: &Message, opname: Ident) -> MsgGen {
     let mut ser = Vec::with_capacity(m.args.len());
     let mut dsr = Vec::with_capacity(m.args.len());
 
+    req_new_id.push(quote! {
+        let cl = match self.cl.upgrade() {
+            Some(cl) => cl,
+            None => return Err(WlSerError::ClientUnavailable),
+        };
+        let mut cl = cl.borrow();
+    });
+
     for a in &m.args {
         let name = tok_id(str_(&a.name));
+        let ret_name = tok_id(&format!("ret_{}", str_(&a.name)));
         let ty = ty_ident(a, false);
         let req_ty = ty_ident(a, true);
 
         match (a.r#type.as_slice(), a.allow_null) {
             (b"object" | b"new_id", false) => dsr.push(quote! {
-                let (#name, sz): (Option<#ty>, usize) = <Option<#ty> as WlDsr>::dsr(reg, buf, fdbuf)?;
+                let (#name, sz): (Option<#ty>, usize) = <Option<#ty> as WlDsr>::dsr(cl, buf, fdbuf)?;
                 let #name = #name.unwrap();
                 let buf = &mut buf[sz..];
             }),
             _ => dsr.push(quote! {
-                let (#name, sz): (#ty, usize) = <#ty as WlDsr>::dsr(reg, buf, fdbuf)?;
+                let (#name, sz): (#ty, usize) = <#ty as WlDsr>::dsr(cl, buf, fdbuf)?;
                 let buf = &mut buf[sz..];
             })
         }
@@ -185,31 +194,34 @@ fn gen_args(m: &Message, opname: Ident) -> MsgGen {
         ser.push(quote! { #name.ser(buf, fdbuf)?; });
         req_arg_ty.push(name.clone(), req_ty.clone());
         if &a.r#type == b"new_id" {
-            req_new_id.push(quote! { let #name = cl.new_id(#name); });
-            req_ret_arg_ty.push(name.clone(), ty.clone());
-        }
-        if matches!(a.r#type.as_slice(), b"new_id" | b"object") && a.interface.is_none() {
-            let gname = tok_id(&to_camelcase(str_(&a.name)));
-            req_arg_ty
-                .gen_constraints
-                .push(quote! { #gname : Interface });
-            if &a.r#type == b"new_id" {
-                req_new_id
-                    .push(quote! { let interface : WlStr = <WlRef<#gname> as InterfaceDesc>::NAME.into(); });
-                req_new_id
-                    .push(quote! { let version = <WlRef<#gname> as InterfaceDesc>::VERSION; });
-                req_new_id.push(quote! { let #name = #name.as_dyn(); });
+            if a.interface.is_some() {
+                req_new_id.push(quote! {
+                    let #name = cl.new_id(#name);
+                    let #ret_name = #name.clone();
+                });
+            } else {
+                let gname = tok_id(&to_camelcase(str_(&a.name)));
                 req_arg_ty
                     .gen_constraints
-                    .push(quote! { WlRef<#gname>: InterfaceDesc });
+                    .push(quote! { #gname : Interface });
+                req_arg_ty
+                    .gen_constraints
+                    .push(quote! { #gname: InterfaceDesc });
+
+                arg_ty.push(tok_id("interface"), quote! {  WlStr });
+                arg_ty.push(tok_id("version"), quote! { u32 });
+                req_new_id.push(quote! {
+                    let interface : WlStr = <#gname as InterfaceDesc>::NAME.into();
+                    let version = <#gname as InterfaceDesc>::VERSION;
+                    let #name = cl.new_id(#name).as_dyn();
+                    let #ret_name = #name.clone();
+                });
+
+                req_arg_ty.gen.push(gname);
             }
-            req_arg_ty.gen.push(gname);
+            req_ret_arg_ty.push(ret_name.clone(), ty.clone());
         }
 
-        if a.r#type.as_slice() == b"new_id" && a.interface.is_none() {
-            arg_ty.push(tok_id("interface"), quote! {  WlStr });
-            arg_ty.push(tok_id("version"), quote! { u32 });
-        }
         arg_ty.push(name, ty);
     }
 
@@ -299,17 +311,16 @@ fn gen_message(
                 #[doc = #desc]
                 pub fn #fnname #fngen (
                     &self,
-                    cl: &mut WlClient,
                     #req_arg_ty
                 ) -> Result<(#(#req_ret_ty),*), WlSerError>
                     #fnwhere
                 {
                     #(#req_new_id)*
                     let req = Request::#name{ #(#args),* };
-                    if matches!(std::env::var("WAYLAND_DEBUG").as_ref().map(String::as_str), Ok("1")) {
+                    if wayland_debug_enabled() {
                         println!("[{}] -> {req:?}", timestamp());
                     }
-                    cl.send(*self, req);
+                    cl.send(self, req)?;
                     Ok((#(#req_ret_val),*))
                 }
             });
@@ -317,8 +328,12 @@ fn gen_message(
     }
 }
 
-fn gen_enum(n: &Enum, enms: &mut Vec<TokenStream>) {
-    let name = tok_id(&to_camelcase(str_(&n.name)));
+fn gen_enum(n: &Enum, enms: &mut Vec<TokenStream>, opts: GenOptions<'_>) {
+    let name = opts.rewrite(&n.name);
+    if let std::borrow::Cow::Owned(_) = name {
+        eprintln!("REWROTE: {} -> {:?}", str_(&n.name), str_(&name));
+    }
+    let name = tok_id(&to_camelcase(str_(&name)));
     let mut entries = Vec::with_capacity(n.entries.len());
     let mut from_cases = Vec::with_capacity(n.entries.len());
     for e in &n.entries {
@@ -341,8 +356,8 @@ fn gen_enum(n: &Enum, enms: &mut Vec<TokenStream>) {
 
     let dsr_ser = quote! {
         impl WlDsr for #name {
-            fn dsr(reg: &ObjectRegistry, buf: &mut [u8], fdbuf: &mut Vec<RawFd>) -> Result<(Self, usize), WlDsrError> {
-                let (n, sz) = u32::dsr(reg, buf, fdbuf)?;
+            fn dsr(cl: &WlClient, buf: &mut [u8], fdbuf: &mut Vec<RawFd>) -> Result<(Self, usize), WlDsrError> {
+                let (n, sz) = u32::dsr(cl, buf, fdbuf)?;
                 Ok((n.try_into().unwrap(), sz))
             }
         }
@@ -392,7 +407,48 @@ fn gen_enum(n: &Enum, enms: &mut Vec<TokenStream>) {
     }
 }
 
-pub fn generate(p: &Protocol) -> TokenStream {
+#[derive(Clone, Copy)]
+pub struct GenOptions<'g> {
+    pub reused: &'g [(Vec<u8>, Vec<u8>)],
+    pub rewrite: &'g [&'g dyn Fn(&[u8], &[u8], &[u8]) -> Option<Vec<u8>>],
+
+    pub cur: (&'g [u8], &'g [u8]),
+}
+
+fn default_rewrites(iface: &[u8], version: &[u8], ident: &[u8]) -> Option<Vec<u8>> {
+    match (iface, version, ident) {
+        (b"wp_content_type_v1", b"1", b"type") => Some(b"content_type".to_vec()),
+        _ => None,
+    }
+}
+
+impl std::default::Default for GenOptions<'_> {
+    fn default() -> Self {
+        GenOptions {
+            reused: &[],
+            rewrite: &[&default_rewrites],
+
+            cur: (&[], &[]),
+        }
+    }
+}
+
+impl<'g> GenOptions<'g> {
+    fn should_reuse(&self, name: &[u8]) -> bool {
+        !self.reused.iter().any(|(n, _)| n == name)
+    }
+
+    fn rewrite<'n>(&self, name: &'n [u8]) -> std::borrow::Cow<'n, [u8]> {
+        for rw in self.rewrite {
+            if let Some(v) = rw(self.cur.0, self.cur.1, name) {
+                return std::borrow::Cow::Owned(v);
+            }
+        }
+        std::borrow::Cow::Borrowed(name)
+    }
+}
+
+pub fn generate(p: &Protocol, options: GenOptions<'_>) -> TokenStream {
     let Protocol { interfaces, .. } = p;
     let mut ifaces: Vec<TokenStream> = Vec::with_capacity(interfaces.len());
 
@@ -405,11 +461,11 @@ pub fn generate(p: &Protocol) -> TokenStream {
         ..
     } in interfaces
     {
-        let name = str_(&name);
-        let iobjname = tok_id(&to_camelcase(name));
-        let nameid = tok_id(name);
+        let iname = str_(&name);
+        let iversion: u32 = str_(&version).parse().unwrap();
+        let iobjname = tok_id(&to_camelcase(iname));
+        let modname = quote::format_ident!("{iname}_v{iversion}");
         let idoc = str_(&description);
-        let version: u32 = str_(&version).parse().unwrap();
 
         let mut vops: Vec<TokenStream> = Vec::with_capacity(messages.len());
         let mut rops: Vec<TokenStream> = Vec::with_capacity(messages.len());
@@ -437,15 +493,32 @@ pub fn generate(p: &Protocol) -> TokenStream {
             );
         }
 
+        let pub_use = if options.should_reuse(name) {
+            let iname = tok_id(iname);
+            quote! {
+                pub use #modname as #iname;
+                pub type #iobjname = #modname::Proxy;
+            }
+        } else {
+            quote! {}
+        };
+
         let mut enms: Vec<TokenStream> = Vec::with_capacity(enums.len());
         for n in enums {
-            gen_enum(n, &mut enms);
+            gen_enum(
+                n,
+                &mut enms,
+                GenOptions {
+                    cur: (name, version),
+                    ..options
+                },
+            );
         }
 
-        let name_null = format!("{}\0", name);
+        let name_null = format!("{}\0", iname);
         ifaces.push(quote! {
             #[doc = #idoc]
-            pub mod #nameid {
+            pub mod #modname {
                 use super::*;
 
                 #(#enms)*
@@ -460,37 +533,32 @@ pub fn generate(p: &Protocol) -> TokenStream {
                     #(#rops)*
                 }
 
-                type EventHandler = Box<dyn Fn(&ObjectRegistry, Event) -> Result<(), WlHandleError>>;
+                type EventHandler<T> = Box<dyn Fn(&T, &WlClient, Event) -> Result<(), WlHandleError>>;
                 pub struct Proxy {
-                    pub on_event: Option<EventHandler>,
+                    on_event: Option<EventHandler<Proxy>>,
                 }
 
                 impl Proxy {
-                    pub fn new(on_event: impl Fn(&ObjectRegistry, Event) -> Result<(), WlHandleError> + 'static) -> Proxy {
+                    pub fn new(on_event: impl Fn(&Proxy, &WlClient, Event) -> Result<(), WlHandleError> + 'static) -> Proxy {
                         Proxy{ on_event: Some(Box::new(on_event)) }
                     }
-
                 }
 
-                impl std::fmt::Debug for WlRef<Proxy> {
-                    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                        write!(f, "{}@{}", #name, self.id)
-                    }
-                }
-
-                impl InterfaceDesc for WlRef<Proxy> {
+                impl InterfaceDesc for Proxy {
+                    type Request = Request;
+                    type Event = Event;
                     const NAME: &'static std::ffi::CStr = unsafe { std::ffi::CStr::from_bytes_with_nul_unchecked(#name_null.as_bytes()) };
-                    const VERSION: u32 = #version;
+                    const VERSION: u32 = #iversion;
                 }
 
                 impl Interface for Proxy {
-                    fn handle(&self, reg: &ObjectRegistry, op: u16, buf: &mut [u8], fdbuf: &mut Vec<RawFd>) -> Result<(), WlHandleError> {
-                        let (event, _) = Event::dsr(reg, buf, fdbuf).map_err(WlHandleError::Deser)?;
-                        if matches!(std::env::var("WAYLAND_DEBUG").as_ref().map(String::as_str), Ok("1")) {
-                            println!("[{}] <- {event:?}", timestamp());
+                    fn handle(&self, cl: &WlClient, id: u32, op: u16, buf: &mut [u8], fdbuf: &mut Vec<RawFd>) -> Result<(), WlHandleError> {
+                        let (event, _) = Event::dsr(cl, buf, fdbuf).map_err(WlHandleError::Deser)?;
+                        if wayland_debug_enabled() {
+                            println!("[{}] {}@{id} <- {event:?}", timestamp(), <Proxy as InterfaceDesc>::NAME.to_str().unwrap());
                         }
                         match &self.on_event {
-                            Some(cb) => cb(reg, event),
+                            Some(cb) => cb(self, cl, event),
                             None => Err(WlHandleError::Unhandled),
                         }
                     }
@@ -504,7 +572,7 @@ pub fn generate(p: &Protocol) -> TokenStream {
 
                 impl WlDsr for Event {
                     fn dsr(
-                        reg: &ObjectRegistry,
+                        cl: &WlClient,
                         buf: &mut [u8],
                         fdbuf: &mut Vec<RawFd>,
                     ) -> Result<(Self, usize), WlDsrError> {
@@ -531,7 +599,8 @@ pub fn generate(p: &Protocol) -> TokenStream {
                     }
                 }
             }
-            pub type #iobjname = #nameid::Proxy;
+
+            #pub_use
         });
     }
 

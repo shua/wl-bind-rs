@@ -11,19 +11,249 @@ use std::sync::{Once, RwLock};
 
 mod sockio;
 
-pub struct ObjectRegistry {
+struct BufStream {
+    sock: UnixStream,
+    buf: Vec<u8>,
+    fdbuf: Vec<RawFd>,
+}
+
+pub struct WlClient {
+    read: RefCell<BufStream>,
+    write: RefCell<BufStream>,
+
+    display: WlRef<WlDisplay>,
+    registry: WlRef<WlRegistry>,
+
     bound: RefCell<Vec<RefCell<Option<Box<dyn Interface>>>>>,
     new_ids: RefCell<Vec<Box<dyn Interface>>>,
     globals: RefCell<Vec<(u32, WlStr, u32)>>,
 }
 
-impl ObjectRegistry {
-    pub fn new(display: WlDisplay) -> ObjectRegistry {
-        ObjectRegistry {
-            bound: RefCell::new(vec![RefCell::new(Some(Box::new(display)))]),
-            new_ids: RefCell::new(vec![]),
-            globals: RefCell::new(vec![]),
+impl WlClient {
+    // To find the Unix socket to connect to, most implementations just do what libwayland does:
+    //
+    // 1. If WAYLAND_SOCKET is set, interpret it as a file descriptor number on which the connection is already established, assuming that the parent process configured the connection for us.
+    // 2. If WAYLAND_DISPLAY is set, concat with XDG_RUNTIME_DIR to form the path to the Unix socket.
+    // 3. Assume the socket name is wayland-0 and concat with XDG_RUNTIME_DIR to form the path to the Unix socket.
+    // 4. Give up.
+    fn find_socket() -> std::io::Result<UnixStream> {
+        let sock = if let Ok(sock) = std::env::var("WAYLAND_SOCKET") {
+            sock
+        } else {
+            let runtime_dir = std::env::var("XDG_RUNTIME_DIR").unwrap();
+            if let Ok(disp) = std::env::var("WAYLAND_DISPLAY") {
+                let runtime_dir = std::env::var("XDG_RUNTIME_DIR").unwrap();
+                format!("{runtime_dir}/{disp}")
+            } else {
+                format!("{runtime_dir}/wayland-0")
+            }
+        };
+        println!("connecting to {sock}");
+        UnixStream::connect(sock)
+    }
+
+    fn print_error(
+        _: &WlDisplay,
+        _: &WlClient,
+        object_id: WlRef<dyn Interface>,
+        code: u32,
+        message: WlStr,
+    ) -> Result<(), WlHandleError> {
+        eprintln!(
+            "server: {object_id:?} {code}: {}",
+            message.to_str().unwrap()
+        );
+        panic!("fatal error");
+    }
+
+    pub fn new() -> std::io::Result<Rc<RefCell<WlClient>>> {
+        let display = WlDisplay::new(|display, cl, e| match e {
+            wl_display::Event::Error {
+                object_id,
+                code,
+                message,
+            } => WlClient::print_error(display, cl, object_id, code, message),
+            wl_display::Event::DeleteId { id } => {
+                cl.destroy(id);
+                Ok(())
+            }
+        });
+        let registry = WlRegistry::new(|reg: &_, cl, e| match e {
+            wl_registry::Event::Global {
+                name,
+                interface,
+                version,
+            } => Ok(cl.global(name, interface, version)),
+            wl_registry::Event::GlobalRemove { name } => Ok(cl.global_remove(name)),
+        });
+
+        let sock = WlClient::find_socket()?;
+        let write_sock = sock.try_clone().unwrap();
+        sock.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+        let cl = Rc::new_cyclic(|cl| {
+            RefCell::new(WlClient {
+                read: RefCell::new(BufStream {
+                    sock,
+                    buf: Vec::with_capacity(1024),
+                    fdbuf: Vec::with_capacity(4),
+                }),
+                write: RefCell::new(BufStream {
+                    sock: write_sock,
+                    buf: Vec::with_capacity(1024),
+                    fdbuf: Vec::with_capacity(4),
+                }),
+
+                display: WlRef {
+                    cl: cl.clone(),
+                    id: 1,
+                    marker: PhantomData,
+                },
+                registry: WlRef {
+                    cl: cl.clone(),
+                    id: 0,
+                    marker: PhantomData,
+                },
+
+                bound: RefCell::new(vec![RefCell::new(Some(Box::new(display)))]),
+                new_ids: RefCell::new(vec![]),
+                globals: RefCell::new(vec![]),
+            })
+        });
+
+        let registry = cl.borrow().display.get_registry(registry).unwrap();
+        cl.borrow_mut().registry = registry;
+        let cb = cl
+            .borrow()
+            .display
+            .sync(WlCallback::new(|me, cl, e| match e {
+                wl_callback::Event::Done { callback_data } => Ok(println!("done getting globals")),
+            }));
+        Ok(cl)
+    }
+
+    pub fn bind_global<T>(&self, global: T) -> Result<WlRef<T>, WlSerError>
+    where
+        T: Interface,
+        T: InterfaceDesc,
+    {
+        let name = {
+            let name = &<T as InterfaceDesc>::NAME;
+            let version = <T as InterfaceDesc>::VERSION;
+            let globals = self.globals.borrow();
+
+            if let Some((n, _, _)) = globals
+                .iter()
+                .find(|(_, i, v)| i.as_c_str() == *name && *v == version)
+            {
+                *n
+            } else {
+                return Err(WlSerError::BindWrongType);
+            }
+        };
+
+        let registry = self.registry.clone();
+        let rdyn = registry.bind(name, global)?;
+        Ok(WlRef {
+            cl: self.display.cl.clone(),
+            id: rdyn.id,
+            marker: PhantomData,
+        })
+    }
+
+    pub fn describe_globals(&self) -> Vec<(String, u32)> {
+        let globals = self.globals.borrow();
+        globals
+            .iter()
+            .filter(|(n, _, _)| *n != 0)
+            .map(|(_, i, v)| (i.to_str().unwrap().to_string(), *v))
+            .collect()
+    }
+
+    fn send<T>(&self, r: &WlRef<T>, req: T::Request) -> Result<(), WlSerError>
+    where
+        T: InterfaceDesc,
+        WlRef<T>: std::fmt::Debug,
+        T::Request: std::fmt::Debug,
+    {
+        if wayland_debug_enabled() {
+            println!("[{}] {:?} -> {:?}", timestamp(), r, req);
         }
+
+        let bsock = &mut *self.write.borrow_mut();
+        bsock.buf.truncate(0);
+        bsock.buf.extend(r.id.to_ne_bytes());
+        req.ser(&mut bsock.buf, &mut bsock.fdbuf)?;
+        let n = sockio::sendmsg(&mut bsock.sock, &bsock.buf, &bsock.fdbuf);
+        bsock.buf.truncate(0);
+        bsock.fdbuf.truncate(0);
+        if n < bsock.buf.len() {
+            // not even sure we can retry the message here?
+            // TODO: check wayland docs for what we can do on socket errors
+            panic!("buffer underwrite");
+        }
+        Ok(())
+    }
+
+    fn print_buf_u32(buf: &[u8]) {
+        for c in buf.chunks(4) {
+            print!("{:08x} ", u32::from_ne_bytes(c.try_into().unwrap()));
+        }
+        println!();
+    }
+
+    pub fn poll(&self, blocking: bool) -> Result<Option<()>, ()> {
+        let mut bsock = &mut *self.read.borrow_mut();
+        bsock.sock.set_nonblocking(!blocking).map_err(|_| ())?;
+        const WORD_SZ: usize = std::mem::size_of::<u32>();
+        const HDR_SZ: usize = WORD_SZ * 2;
+        let buf_len = bsock.buf.len();
+        let fdbuf_len = bsock.fdbuf.len();
+
+        let (bufn, fdbufn) = sockio::recvmsg(&mut bsock.sock, &mut bsock.buf, &mut bsock.fdbuf)?;
+        if bufn == 0 && fdbufn == 0 {
+            return Ok(None);
+        }
+
+        let mut i = 0;
+        while bsock.buf[i..].len() > HDR_SZ {
+            self.update_ids();
+            let buf = &mut bsock.buf[i..];
+            let id = u32::from_ne_bytes(buf[..WORD_SZ].try_into().unwrap());
+            let (sz, op): (usize, u16) = {
+                let szop = u32::from_ne_bytes(buf[WORD_SZ..HDR_SZ].try_into().unwrap());
+                (
+                    (szop >> 16).try_into().unwrap(),
+                    (szop & 0xffff).try_into().unwrap(),
+                )
+            };
+            if buf.len() < sz {
+                break;
+            }
+            i += sz;
+
+            let objid: usize = usize::try_from(id).unwrap();
+            let hborrow = self.bound.borrow();
+            let obj = hborrow.get(objid - 1).map(RefCell::borrow);
+            let obj = match obj {
+                Some(obj) if obj.is_some() => obj,
+                _ => {
+                    eprintln!("message for non-existent object (@{id})");
+                    continue;
+                }
+            };
+            let obj = obj.as_ref().unwrap();
+
+            let buf = &mut buf[..sz];
+            obj.handle(self, id, op, buf, &mut bsock.fdbuf)
+                .map_err(|e| eprintln!("handle err: {e:?}"))?;
+        }
+
+        // move unhandled bytes to front of buf, truncate
+        bsock.buf.copy_within(i.., 0);
+        bsock.buf.truncate(bsock.buf.len() - i);
+        self.update_ids();
+
+        Ok(Some(()))
     }
 
     fn print_ids(&self) {
@@ -39,30 +269,19 @@ impl ObjectRegistry {
         );
     }
 
-    fn update_ids(&mut self) {
-        let new_ids = std::mem::replace(self.new_ids.get_mut(), vec![]);
+    fn update_ids(&self) {
+        let new_ids = std::mem::replace(&mut *self.new_ids.borrow_mut(), vec![]);
         for h in new_ids.into_iter() {
-            self.bound.get_mut().push(RefCell::new(Some(h)));
+            self.bound.borrow_mut().push(RefCell::new(Some(h)));
         }
     }
 
-    pub fn get_mut<T: Interface>(&mut self, r: WlRef<T>) -> Option<&mut T> {
-        let id: usize = r.id.try_into().unwrap();
-        let dyn_h = &mut **self.bound.get_mut().get_mut(id - 1)?.get_mut().as_mut()?;
-        // basically copying dyn Any impl
-        if dyn_h.is::<T>() {
-            // SAFETY: we just checked this is the correct type
-            Some(unsafe { &mut *(dyn_h as *mut dyn Interface as *mut T) })
-        } else {
-            None
-        }
-    }
-
-    pub fn new_id<T: Interface>(&self, init: T) -> WlRef<T> {
+    pub fn new_id<T: Interface>(&self, mut init: T) -> WlRef<T> {
         let mut hs = self.bound.borrow();
         if let Some((i, v)) = hs.iter().enumerate().find(|(_, v)| (*v).borrow().is_none()) {
             v.borrow_mut().replace(Box::new(init));
             let r = WlRef {
+                cl: self.display.cl.clone(),
                 id: (i + 1).try_into().unwrap(),
                 marker: PhantomData,
             };
@@ -74,6 +293,7 @@ impl ObjectRegistry {
         let i = i + hs.len();
         hs.push(Box::new(init));
         WlRef {
+            cl: self.display.cl.clone(),
             id: (i + 1).try_into().unwrap(),
             marker: PhantomData,
         }
@@ -130,261 +350,19 @@ impl ObjectRegistry {
         let concrete = (&**dyn_h).type_id();
         if ttid == std::any::TypeId::of::<dyn Interface>() || concrete == ttid {
             let marker = PhantomData;
-            Some(WlRef { id, marker })
+            Some(WlRef {
+                cl: self.display.cl.clone(),
+                id,
+                marker,
+            })
         } else {
             None
         }
-    }
-}
-
-pub struct WlClient {
-    sock: UnixStream,
-    buf: Vec<u8>,
-    fdbuf: Vec<RawFd>,
-
-    display: WlRef<WlDisplay>,
-    registry: WlRef<WlRegistry>,
-    handlers: ObjectRegistry,
-}
-
-impl WlClient {
-    // To find the Unix socket to connect to, most implementations just do what libwayland does:
-    //
-    // 1. If WAYLAND_SOCKET is set, interpret it as a file descriptor number on which the connection is already established, assuming that the parent process configured the connection for us.
-    // 2. If WAYLAND_DISPLAY is set, concat with XDG_RUNTIME_DIR to form the path to the Unix socket.
-    // 3. Assume the socket name is wayland-0 and concat with XDG_RUNTIME_DIR to form the path to the Unix socket.
-    // 4. Give up.
-    fn find_socket() -> std::io::Result<UnixStream> {
-        let sock = if let Ok(sock) = std::env::var("WAYLAND_SOCKET") {
-            sock
-        } else {
-            let runtime_dir = std::env::var("XDG_RUNTIME_DIR").unwrap();
-            if let Ok(disp) = std::env::var("WAYLAND_DISPLAY") {
-                let runtime_dir = std::env::var("XDG_RUNTIME_DIR").unwrap();
-                format!("{runtime_dir}/{disp}")
-            } else {
-                format!("{runtime_dir}/wayland-0")
-            }
-        };
-        println!("connecting to {sock}");
-        UnixStream::connect(sock)
-    }
-
-    fn print_error(
-        _: &ObjectRegistry,
-        object_id: WlRef<dyn Interface>,
-        code: u32,
-        message: WlStr,
-    ) -> Result<(), WlHandleError> {
-        eprintln!(
-            "server: {object_id:?} {code}: {}",
-            message.to_str().unwrap()
-        );
-        panic!("fatal error");
-    }
-
-    pub fn on_error<CB>(&mut self, cb: CB)
-    where
-        CB: Fn(&ObjectRegistry, WlRef<dyn Interface>, u32, WlStr) -> Result<(), WlHandleError>
-            + 'static,
-    {
-        let disp = self.display;
-        self.get_mut(disp).unwrap().on_event = Some(Box::new(move |reg, e| match e {
-            wl_display::Event::Error {
-                object_id,
-                code,
-                message,
-            } => cb(reg, object_id, code, message),
-            wl_display::Event::DeleteId { id } => {
-                reg.destroy(id);
-                Ok(())
-            }
-        }));
-    }
-
-    pub fn new() -> std::io::Result<WlClient> {
-        let display = WlDisplay {
-            on_event: Some(Box::new(|reg: &ObjectRegistry, e| match e {
-                wl_display::Event::Error {
-                    object_id,
-                    code,
-                    message,
-                } => WlClient::print_error(reg, object_id, code, message),
-                wl_display::Event::DeleteId { id } => {
-                    reg.destroy(id);
-                    Ok(())
-                }
-            })),
-        };
-        let registry = WlRegistry {
-            on_event: Some(Box::new(|reg: &_, e| match e {
-                wl_registry::Event::Global {
-                    name,
-                    interface,
-                    version,
-                } => Ok(reg.global(name, interface, version)),
-                wl_registry::Event::GlobalRemove { name } => Ok(reg.global_remove(name)),
-            })),
-        };
-        let sock = WlClient::find_socket()?;
-        sock.set_nonblocking(true);
-        let mut c = WlClient {
-            sock,
-            buf: Vec::with_capacity(1024),
-            fdbuf: Vec::with_capacity(255),
-            display: WlRef {
-                id: 1,
-                marker: PhantomData,
-            },
-            // this is effectively a null pointer
-            // which gets initialized immediately
-            registry: WlRef {
-                id: 0,
-                marker: PhantomData,
-            },
-            handlers: ObjectRegistry::new(display),
-        };
-        let display = c.display;
-        c.registry = display.get_registry(&mut c, registry).unwrap();
-        let cb = display.sync(
-            &mut c,
-            WlCallback::new(|reg, e| match e {
-                wl_callback::Event::Done { callback_data } => Ok(println!("done getting globals")),
-            }),
-        );
-        Ok(c)
-    }
-
-    pub fn bind_global<T: Interface>(&mut self, global: T) -> Result<WlRef<T>, WlSerError>
-    where
-        WlRef<T>: InterfaceDesc,
-    {
-        let name = {
-            let name = &<WlRef<T> as InterfaceDesc>::NAME;
-            let version = <WlRef<T> as InterfaceDesc>::VERSION;
-            let globals = self.handlers.globals.borrow();
-
-            if let Some((n, _, _)) = globals
-                .iter()
-                .find(|(_, i, v)| i.as_c_str() == *name && *v == version)
-            {
-                *n
-            } else {
-                return Err(WlSerError::BindWrongType);
-            }
-        };
-
-        let registry = self.registry;
-        let rdyn = registry.bind(self, name, global)?;
-        Ok(WlRef {
-            id: rdyn.id,
-            marker: PhantomData,
-        })
-    }
-
-    pub fn describe_globals(&self) -> Vec<(String, u32)> {
-        let globals = self.handlers.globals.borrow();
-        globals
-            .iter()
-            .filter(|(n, _, _)| *n != 0)
-            .map(|(_, i, v)| (i.to_str().unwrap().to_string(), *v))
-            .collect()
-    }
-
-    pub fn get_mut<T: Interface>(&mut self, r: WlRef<T>) -> Option<&mut T> {
-        // we control the display
-        if r.id != 1 {
-            self.handlers.get_mut(r)
-        } else {
-            None
-        }
-    }
-
-    pub fn new_id<T: Interface>(&mut self, init: T) -> WlRef<T> {
-        self.handlers.new_id(init)
-    }
-
-    fn send<T: Interface>(
-        &mut self,
-        r: WlRef<T>,
-        req: impl WlSer + 'static,
-    ) -> Result<(), WlSerError> {
-        self.buf.truncate(0);
-        self.buf.extend(r.id.to_ne_bytes());
-        req.ser(&mut self.buf, &mut self.fdbuf)?;
-        self.handlers.update_ids();
-        let n = sockio::sendmsg(&mut self.sock, &self.buf, &self.fdbuf);
-        self.buf.truncate(0);
-        self.fdbuf.truncate(0);
-        if n < self.buf.len() {
-            // not even sure we can retry the message here?
-            // TODO: check wayland docs for what we can do on socket errors
-            panic!("buffer underwrite");
-        }
-        Ok(())
-    }
-
-    fn print_buf_u32(buf: &[u8]) {
-        for c in buf.chunks(4) {
-            print!("{:08x} ", u32::from_ne_bytes(c.try_into().unwrap()));
-        }
-        println!();
-    }
-
-    pub fn poll(&mut self) -> Result<Option<()>, ()> {
-        const WORD_SZ: usize = std::mem::size_of::<u32>();
-        const HDR_SZ: usize = WORD_SZ * 2;
-        let buf_len = self.buf.len();
-        let fdbuf_len = self.fdbuf.len();
-
-        let (bufn, fdbufn) = sockio::recvmsg(&mut self.sock, &mut self.buf, &mut self.fdbuf)?;
-        if bufn == 0 && fdbufn == 0 {
-            return Ok(None);
-        }
-
-        let mut i = 0;
-        while self.buf[i..].len() > HDR_SZ {
-            let buf = &mut self.buf[i..];
-            let id = u32::from_ne_bytes(buf[..WORD_SZ].try_into().unwrap());
-            let (sz, op): (usize, u16) = {
-                let szop = u32::from_ne_bytes(buf[WORD_SZ..HDR_SZ].try_into().unwrap());
-                (
-                    (szop >> 16).try_into().unwrap(),
-                    (szop & 0xffff).try_into().unwrap(),
-                )
-            };
-            if buf.len() < sz {
-                break;
-            }
-            i += sz;
-
-            let objid: usize = usize::try_from(id).unwrap();
-            let hborrow = self.handlers.bound.borrow();
-            let obj = hborrow.get(objid - 1).map(RefCell::borrow);
-            let obj = match obj {
-                Some(obj) if obj.is_some() => obj,
-                _ => {
-                    eprintln!("message for non-existent object (@{id})");
-                    continue;
-                }
-            };
-            let obj = obj.as_ref().unwrap();
-
-            let buf = &mut buf[..sz];
-            obj.handle(&self.handlers, op, buf, &mut self.fdbuf)
-                .map_err(|e| eprintln!("handle err: {e:?}"))?;
-        }
-
-        // move unhandled bytes to front of buf, truncate
-        self.buf.copy_within(i.., 0);
-        self.buf.truncate(self.buf.len() - i);
-        self.handlers.update_ids();
-
-        Ok(Some(()))
     }
 }
 
 pub struct WlRef<T: ?Sized> {
+    cl: std::rc::Weak<RefCell<WlClient>>,
     id: u32,
     marker: PhantomData<T>,
 }
@@ -392,22 +370,31 @@ pub struct WlRef<T: ?Sized> {
 impl<T: ?Sized> Clone for WlRef<T> {
     fn clone(&self) -> Self {
         WlRef {
+            cl: self.cl.clone(),
             id: self.id,
             marker: self.marker,
         }
     }
 }
-impl<T: ?Sized> Copy for WlRef<T> {}
 
 impl std::fmt::Debug for WlRef<dyn Interface> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "object@{}", self.id)
     }
 }
+impl<T> std::fmt::Debug for WlRef<T>
+where
+    T: InterfaceDesc,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}@{}", T::NAME.to_str().unwrap(), self.id)
+    }
+}
 
 impl<T: Interface> WlRef<T> {
     fn as_dyn(self) -> WlRef<dyn Interface> {
         WlRef {
+            cl: self.cl,
             id: self.id,
             marker: PhantomData,
         }
@@ -523,6 +510,8 @@ macro_rules! delegate_op {
 delegate_op! { WlFixed Neg::neg() Add::add(rhs) Sub::sub(rhs) }
 
 pub trait InterfaceDesc {
+    type Request: WlSer;
+    type Event: WlDsr;
     const NAME: &'static std::ffi::CStr;
     const VERSION: u32;
 }
@@ -530,7 +519,8 @@ pub trait InterfaceDesc {
 pub trait Interface: 'static {
     fn handle(
         &self,
-        reg: &ObjectRegistry,
+        cl: &WlClient,
+        id: u32,
         op: u16,
         buf: &mut [u8],
         fds: &mut Vec<RawFd>,
@@ -559,15 +549,21 @@ impl From<std::convert::Infallible> for WlHandleError {
     }
 }
 
-trait WlDsr: Sized {
+fn wayland_debug_enabled() -> bool {
+    std::env::var("WAYLAND_DEBUG")
+        .map(|v| v.as_str() == "1")
+        .unwrap_or(false)
+}
+
+pub trait WlDsr: Sized {
     fn dsr(
-        reg: &ObjectRegistry,
+        cl: &WlClient,
         buf: &mut [u8],
         fdbuf: &mut Vec<RawFd>,
     ) -> Result<(Self, usize), WlDsrError>;
 }
 
-trait WlSer {
+pub trait WlSer {
     fn ser(&self, buf: &mut Vec<u8>, fdbuf: &mut Vec<RawFd>) -> Result<(), WlSerError>;
 }
 
@@ -582,7 +578,7 @@ macro_rules! impl_dsr {
     ($t:ty) => {
         impl WlDsr for $t {
             fn dsr(
-                reg: &ObjectRegistry,
+                cl: &WlClient,
                 buf: &mut [u8],
                 fdbuf: &mut Vec<RawFd>,
             ) -> Result<(Self, usize), WlDsrError> {
@@ -600,11 +596,11 @@ impl_dsr! { WlFixed }
 
 impl WlDsr for WlArray {
     fn dsr(
-        reg: &ObjectRegistry,
+        cl: &WlClient,
         buf: &mut [u8],
         fdbuf: &mut Vec<RawFd>,
     ) -> Result<(Self, usize), WlDsrError> {
-        let (z, n) = u32::dsr(reg, buf, fdbuf)?;
+        let (z, n) = u32::dsr(cl, buf, fdbuf)?;
         let z = usize::try_from(z).unwrap();
         Ok((buf[n..(n + z)].to_vec(), ((n + z) + 0x3) & !0x3))
     }
@@ -612,18 +608,18 @@ impl WlDsr for WlArray {
 
 impl WlDsr for WlStr {
     fn dsr(
-        reg: &ObjectRegistry,
+        cl: &WlClient,
         buf: &mut [u8],
         fdbuf: &mut Vec<RawFd>,
     ) -> Result<(Self, usize), WlDsrError> {
-        let (arr, sz) = WlArray::dsr(reg, buf, fdbuf)?;
+        let (arr, sz) = WlArray::dsr(cl, buf, fdbuf)?;
         Ok((std::ffi::CString::from_vec_with_nul(arr).unwrap(), sz))
     }
 }
 
 impl WlDsr for WlFd {
     fn dsr(
-        reg: &ObjectRegistry,
+        cl: &WlClient,
         buf: &mut [u8],
         fdbuf: &mut Vec<RawFd>,
     ) -> Result<(Self, usize), WlDsrError> {
@@ -636,23 +632,23 @@ impl WlDsr for WlFd {
 
 impl<T: 'static + ?Sized> WlDsr for WlRef<T> {
     fn dsr(
-        reg: &ObjectRegistry,
+        cl: &WlClient,
         buf: &mut [u8],
         fdbuf: &mut Vec<RawFd>,
     ) -> Result<(Self, usize), WlDsrError> {
-        let (id, sz) = u32::dsr(reg, buf, fdbuf)?;
-        Ok((reg.make_ref(id).expect("null ref"), sz))
+        let (id, sz) = u32::dsr(cl, buf, fdbuf)?;
+        Ok((cl.make_ref(id).expect("null ref"), sz))
     }
 }
 
 impl<T: 'static + ?Sized> WlDsr for Option<WlRef<T>> {
     fn dsr(
-        reg: &ObjectRegistry,
+        cl: &WlClient,
         buf: &mut [u8],
         fdbuf: &mut Vec<RawFd>,
     ) -> Result<(Self, usize), WlDsrError> {
-        let (id, sz) = u32::dsr(reg, buf, fdbuf)?;
-        Ok((reg.make_ref(id), sz))
+        let (id, sz) = u32::dsr(cl, buf, fdbuf)?;
+        Ok((cl.make_ref(id), sz))
     }
 }
 
@@ -660,6 +656,7 @@ impl<T: 'static + ?Sized> WlDsr for Option<WlRef<T>> {
 pub enum WlSerError {
     InsufficientSpace(usize),
     BindWrongType,
+    ClientUnavailable,
 }
 
 impl From<std::convert::Infallible> for WlSerError {
