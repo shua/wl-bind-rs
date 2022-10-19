@@ -1,4 +1,4 @@
-use crate::{str_, Arg, Enum, Interface, Message, MessageVariant, Protocol};
+use crate::{str_, Arg, Enum, Interface, Message, Protocol};
 use proc_macro2::{Ident, Span, TokenStream};
 use quote::quote;
 
@@ -106,30 +106,37 @@ fn gen_opname(m: &Message, ops: &mut Vec<TokenStream>) -> Ident {
     opname
 }
 
-struct ArgTys {
+#[derive(Default)]
+struct ArgTy {
     arg: Vec<Ident>,
     ty: Vec<TokenStream>,
-    gen: Vec<Ident>,
-    gen_constraints: Vec<TokenStream>,
+}
+
+#[derive(Default)]
+struct ArgTys {
+    enm: ArgTy,
+    req: ArgTy,
+    ret: ArgTy,
+    gen: ArgTy,
 }
 
 impl ArgTys {
     fn new() -> ArgTys {
-        ArgTys {
-            arg: vec![],
-            ty: vec![],
-            gen: vec![],
-            gen_constraints: vec![],
-        }
+        ArgTys::default()
     }
+}
 
+impl ArgTy {
+    fn is_empty(&self) -> bool {
+        self.arg.is_empty() && self.ty.is_empty()
+    }
     fn push(&mut self, arg: Ident, ty: TokenStream) {
         self.arg.push(arg);
         self.ty.push(ty);
     }
 }
 
-impl quote::ToTokens for ArgTys {
+impl quote::ToTokens for ArgTy {
     fn to_tokens(&self, tokens: &mut TokenStream) {
         use quote::TokenStreamExt;
         for i in 0..self.arg.len() {
@@ -146,18 +153,14 @@ impl quote::ToTokens for ArgTys {
 struct MsgGen {
     opname: Ident,
     arg_ty: ArgTys,
-    req_arg_ty: ArgTys,
     req_new_id: Vec<TokenStream>,
-    req_ret_arg_ty: ArgTys,
     ser: Vec<TokenStream>,
     dsr: Vec<TokenStream>,
 }
 
 fn gen_args(m: &Message, opname: Ident) -> MsgGen {
     let mut arg_ty = ArgTys::new();
-    let mut req_arg_ty = ArgTys::new();
     let mut req_new_id = Vec::with_capacity(m.args.len());
-    let mut req_ret_arg_ty = ArgTys::new();
     let mut ser = Vec::with_capacity(m.args.len());
     let mut dsr = Vec::with_capacity(m.args.len());
 
@@ -192,7 +195,7 @@ fn gen_args(m: &Message, opname: Ident) -> MsgGen {
             ser.push(quote! { version.ser(buf, fdbuf)?; });
         }
         ser.push(quote! { #name.ser(buf, fdbuf)?; });
-        req_arg_ty.push(name.clone(), req_ty.clone());
+        arg_ty.req.push(name.clone(), req_ty.clone());
         if &a.r#type == b"new_id" {
             if a.interface.is_some() {
                 req_new_id.push(quote! {
@@ -201,15 +204,9 @@ fn gen_args(m: &Message, opname: Ident) -> MsgGen {
                 });
             } else {
                 let gname = tok_id(&to_camelcase(str_(&a.name)));
-                req_arg_ty
-                    .gen_constraints
-                    .push(quote! { #gname : Interface });
-                req_arg_ty
-                    .gen_constraints
-                    .push(quote! { #gname: InterfaceDesc });
 
-                arg_ty.push(tok_id("interface"), quote! {  WlStr });
-                arg_ty.push(tok_id("version"), quote! { u32 });
+                arg_ty.enm.push(tok_id("interface"), quote! {  WlStr });
+                arg_ty.enm.push(tok_id("version"), quote! { u32 });
                 req_new_id.push(quote! {
                     let interface : WlStr = <#gname as InterfaceDesc>::NAME.into();
                     let version = <#gname as InterfaceDesc>::VERSION;
@@ -217,122 +214,115 @@ fn gen_args(m: &Message, opname: Ident) -> MsgGen {
                     let #ret_name = #name.clone();
                 });
 
-                req_arg_ty.gen.push(gname);
+                arg_ty.gen.push(gname, quote! { Interface + InterfaceDesc });
             }
-            req_ret_arg_ty.push(ret_name.clone(), ty.clone());
+            arg_ty.ret.push(ret_name.clone(), ty.clone());
         }
 
-        arg_ty.push(name, ty);
+        arg_ty.enm.push(name, ty);
     }
 
     MsgGen {
         opname,
         arg_ty,
-        req_arg_ty,
         req_new_id,
-        req_ret_arg_ty,
         ser,
         dsr,
     }
 }
 
-fn gen_message(
-    m: &Message,
-    opname: Ident,
-    events: &mut Vec<TokenStream>,
-    requests: &mut Vec<TokenStream>,
+fn gen_dsr(
     dsr_cases: &mut Vec<TokenStream>,
-    ser_cases: &mut Vec<TokenStream>,
-    req_fns: &mut Vec<TokenStream>,
+    opname: &Ident,
+    name: &Ident,
+    args: &[Ident],
+    dsr: &[TokenStream],
 ) {
-    let name = tok_id(&to_camelcase(str_(&m.name)));
+    dsr_cases.push(quote! {
+        OpCode::#opname => {
+            #(#dsr)*
+            Ok((Event::#name{ #(#args),* }, sz))
+        }
+    })
+}
 
-    let MsgGen {
-        opname,
-        arg_ty,
-        req_arg_ty,
-        req_new_id,
-        req_ret_arg_ty,
-        ser,
-        dsr,
-    } = gen_args(m, opname);
+fn gen_ser(
+    ser_cases: &mut Vec<TokenStream>,
+    opname: &Ident,
+    name: &Ident,
+    args: &[Ident],
+    ser: &[TokenStream],
+) {
+    ser_cases.push(quote! {
+        Request::#name{ #(ref #args),* } => {
+            buf.extend([0u8; 4]);
+            let i = buf.len();
+            #(#ser)*
+            let j = buf.len();
+            let sz : u32 = ((j - i) & 0xffff).try_into().unwrap();
+            let sz = sz + 8;
+            let szop = (sz << 16) | u32::from(OpCode::#opname);
+            buf[i-4..i].copy_from_slice(&szop.to_ne_bytes());
+            Ok(())
+        }
+    });
+}
 
-    let desc = str_(&m.description);
-    let args = &arg_ty.arg;
-    let body = quote! {
-        #[doc = #desc]
-        #name{ #arg_ty },
+fn gen_reqfn(
+    req_fns: &mut Vec<TokenStream>,
+    m: &Message,
+    name: &Ident,
+    desc: &str,
+    arg_tys: &ArgTys,
+    req_new_id: &[TokenStream],
+) {
+    let fnname = match str_(&m.name) {
+        id @ "move" => Ident::new_raw(id, Span::call_site()),
+        id => tok_id(id),
+    };
+    let fngen = if arg_tys.gen.is_empty() {
+        quote! {}
+    } else {
+        let gen_arg_ty = &arg_tys.gen;
+        quote! { <#gen_arg_ty> }
     };
 
-    match m.var {
-        MessageVariant::Event => {
-            events.push(body);
-            dsr_cases.push(quote! {
-                OpCode::#opname => {
-                    #(#dsr)*
-                    Ok((Event::#name{ #(#args),* }, sz))
-                }
-            })
+    let args = &arg_tys.enm.arg;
+    let req_arg_ty = &arg_tys.req;
+    let req_ret_val = &arg_tys.ret.arg;
+    let req_ret_ty = &arg_tys.ret.ty;
+    req_fns.push(quote! {
+        #[doc = #desc]
+        pub fn #fnname #fngen (
+            &self,
+            #req_arg_ty
+        ) -> Result<(#(#req_ret_ty),*), WlSerError>
+        {
+            #(#req_new_id)*
+            let req = Request::#name{ #(#args),* };
+            if wayland_debug_enabled() {
+                println!("[{}] -> {req:?}", timestamp());
+            }
+            cl.send(self, req)?;
+            Ok((#(#req_ret_val),*))
         }
+    });
+}
 
-        MessageVariant::Request => {
-            requests.push(body);
-            ser_cases.push(quote! {
-                Request::#name{ #(ref #args),* } => {
-                    buf.extend([0u8; 4]);
-                    let i = buf.len();
-                    #(#ser)*
-                    let j = buf.len();
-                    let sz : u32 = ((j - i) & 0xffff).try_into().unwrap();
-                    let sz = sz + 8;
-                    let szop = (sz << 16) | u32::from(OpCode::#opname);
-                    buf[i-4..i].copy_from_slice(&szop.to_ne_bytes());
-                    Ok(())
-                }
-            });
-
-            let fnname = match str_(&m.name) {
-                id @ ("fn" | "static" | "union" | "struct" | "move" | "mut" | "ref" | "const"
-                | "box" | "async" | "await" | "impl" | "trait" | "dyn" | "for" | "in"
-                | "let") => Ident::new_raw(id, Span::call_site()),
-                id => tok_id(id),
-            };
-            let (fngen, fnwhere) = if req_arg_ty.gen.is_empty() {
-                (quote! {}, quote! {})
-            } else {
-                let req_gen = req_arg_ty.gen.clone();
-                let req_where = req_arg_ty.gen_constraints.clone();
-                (quote! { <#(#req_gen),*> }, quote! { where #(#req_where),* })
-            };
-
-            let req_ret_val = &req_ret_arg_ty.arg;
-            let req_ret_ty = &req_ret_arg_ty.ty;
-            req_fns.push(quote! {
-                #[doc = #desc]
-                pub fn #fnname #fngen (
-                    &self,
-                    #req_arg_ty
-                ) -> Result<(#(#req_ret_ty),*), WlSerError>
-                    #fnwhere
-                {
-                    #(#req_new_id)*
-                    let req = Request::#name{ #(#args),* };
-                    if wayland_debug_enabled() {
-                        println!("[{}] -> {req:?}", timestamp());
-                    }
-                    cl.send(self, req)?;
-                    Ok((#(#req_ret_val),*))
-                }
-            });
-        }
-    }
+fn gen_message(msgs: &mut Vec<TokenStream>, m: &Message, opcode: Ident) -> (Ident, MsgGen) {
+    let mgen = gen_args(m, opcode);
+    let name = tok_id(&to_camelcase(str_(&m.name)));
+    let desc = str_(&m.description);
+    let enm_arg_ty = &mgen.arg_ty.enm;
+    msgs.push(quote! {
+        #[doc = #desc]
+        #name{ #enm_arg_ty },
+    });
+    (name, mgen)
 }
 
 fn gen_enum(n: &Enum, enms: &mut Vec<TokenStream>, opts: GenOptions<'_>) {
     let name = opts.rewrite(&n.name);
-    if let std::borrow::Cow::Owned(_) = name {
-        eprintln!("REWROTE: {} -> {:?}", str_(&n.name), str_(&name));
-    }
     let name = tok_id(&to_camelcase(str_(&name)));
     let mut entries = Vec::with_capacity(n.entries.len());
     let mut from_cases = Vec::with_capacity(n.entries.len());
@@ -456,7 +446,8 @@ pub fn generate(p: &Protocol, options: GenOptions<'_>) -> TokenStream {
         name,
         version,
         description,
-        messages,
+        events,
+        requests,
         enums,
         ..
     } in interfaces
@@ -467,29 +458,45 @@ pub fn generate(p: &Protocol, options: GenOptions<'_>) -> TokenStream {
         let modname = quote::format_ident!("{iname}_v{iversion}");
         let idoc = str_(&description);
 
-        let mut vops: Vec<TokenStream> = Vec::with_capacity(messages.len());
-        let mut rops: Vec<TokenStream> = Vec::with_capacity(messages.len());
+        let mut vops: Vec<TokenStream> = Vec::with_capacity(events.len());
 
-        let mut events: Vec<TokenStream> = Vec::with_capacity(messages.len());
-        let mut requests: Vec<TokenStream> = Vec::with_capacity(messages.len());
-        let mut dsr_cases: Vec<TokenStream> = Vec::with_capacity(messages.len());
-        let mut ser_cases: Vec<TokenStream> = Vec::with_capacity(messages.len());
-        let mut req_fns: Vec<TokenStream> = Vec::with_capacity(messages.len());
-        for m in messages {
-            use MessageVariant::*;
-            let opname = match m.var {
-                Event => gen_opname(m, &mut vops),
-                Request => gen_opname(m, &mut rops),
-            };
+        let mut gen_events: Vec<TokenStream> = Vec::with_capacity(events.len());
+        let mut dsr_cases: Vec<TokenStream> = Vec::with_capacity(events.len());
+        for v in events {
+            let opname = gen_opname(v, &mut vops);
+            let (name, mgen) = gen_message(&mut gen_events, v, opname);
 
-            gen_message(
-                m,
-                opname,
-                &mut events,
-                &mut requests,
+            gen_dsr(
                 &mut dsr_cases,
+                &mgen.opname,
+                &name,
+                &mgen.arg_ty.enm.arg,
+                &mgen.dsr,
+            );
+        }
+
+        let mut rops: Vec<TokenStream> = Vec::with_capacity(requests.len());
+        let mut gen_requests: Vec<TokenStream> = Vec::with_capacity(requests.len());
+        let mut ser_cases: Vec<TokenStream> = Vec::with_capacity(requests.len());
+        let mut req_fns: Vec<TokenStream> = Vec::with_capacity(requests.len());
+        for r in requests {
+            let opname = gen_opname(r, &mut rops);
+            let (name, mgen) = gen_message(&mut gen_requests, r, opname);
+
+            gen_ser(
                 &mut ser_cases,
+                &mgen.opname,
+                &name,
+                &mgen.arg_ty.enm.arg,
+                &mgen.ser,
+            );
+            gen_reqfn(
                 &mut req_fns,
+                r,
+                &name,
+                str_(&r.description),
+                &mgen.arg_ty,
+                &mgen.req_new_id,
             );
         }
 
@@ -523,9 +530,9 @@ pub fn generate(p: &Protocol, options: GenOptions<'_>) -> TokenStream {
 
                 #(#enms)*
                 #[derive(Debug)]
-                pub enum Event { #(#events)* }
+                pub enum Event { #(#gen_events)* }
                 #[derive(Debug)]
-                pub enum Request { #(#requests)* }
+                pub enum Request { #(#gen_requests)* }
 
                 struct OpCode;
                 impl OpCode {
@@ -606,48 +613,5 @@ pub fn generate(p: &Protocol, options: GenOptions<'_>) -> TokenStream {
 
     quote! {
         #(#ifaces)*
-    }
-}
-
-#[allow(unused)]
-fn generate_dumb(p: Protocol) {
-    println!("protocol {}", str_(&p.name));
-    for i in p.interfaces {
-        println!("  interface {}", str_(&i.name));
-        for (mi, m) in i.messages.iter().enumerate() {
-            let var_s = if m.var == MessageVariant::Request {
-                "request"
-            } else {
-                "event  "
-            };
-            print!("    {} {} {}(", var_s, mi, str_(&m.name));
-            if !m.args.is_empty() {
-                fn ptype(a: &Arg) {
-                    match (a.r#type.as_slice(), &a.interface, &a.r#enum) {
-                        (b"new_id", Some(i), _) => print!("new id {}", str_(i)),
-                        (b"object", Some(i), _) => print!("{}", str_(i)),
-                        (b"int" | b"uint", _, Some(n)) => print!("{}", str_(n)),
-                        (t, _, _) => print!("{}", str_(t)),
-                    }
-                }
-                fn parg(a: &Arg) {
-                    print!("{}: ", str_(&a.name));
-                    ptype(a);
-                }
-                parg(&m.args[0]);
-                for a in m.args[1..].iter() {
-                    print!(", ");
-                    parg(a);
-                }
-            }
-            println!(")");
-        }
-
-        for n in i.enums {
-            println!("    enum   {}", str_(&n.name));
-            for e in n.entries {
-                println!("      {} = {}", str_(&e.name), str_(&e.value));
-            }
-        }
     }
 }

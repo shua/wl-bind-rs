@@ -76,10 +76,11 @@ impl Debug for State {
             Copyright(p) => write!(f, "Protocol({}:copyright)", str_(&p.name)),
             Interface(p, i) => write!(
                 f,
-                "Interface({}:{}:({},{}))",
+                "Interface({}:{}:({},{},{}))",
                 str_(&p.name),
                 str_(&i.name),
-                i.messages.last().map(|r| str_(&r.name)).unwrap_or("*"),
+                i.events.last().map(|r| str_(&r.name)).unwrap_or("*"),
+                i.requests.last().map(|r| str_(&r.name)).unwrap_or("*"),
                 i.enums.last().map(|n| str_(&n.name)).unwrap_or("*"),
             ),
             InterfaceDescription(p, i) => write!(
@@ -239,7 +240,7 @@ pub fn parse(xml: &[u8]) -> Result<Protocol, ParseError> {
                     SI(p, i)
                 }
                 b"request" => {
-                    i.messages.push(Message {
+                    i.requests.push(Message {
                         name: get_attr(&e, "name"),
                         var: MessageVariant::Request,
                         description: vec![],
@@ -248,7 +249,7 @@ pub fn parse(xml: &[u8]) -> Result<Protocol, ParseError> {
                     SI(p, i)
                 }
                 b"event" => {
-                    i.messages.push(Message {
+                    i.events.push(Message {
                         name: get_attr(&e, "name"),
                         var: MessageVariant::Event,
                         description: vec![],
@@ -348,11 +349,11 @@ pub fn parse(xml: &[u8]) -> Result<Protocol, ParseError> {
                 match e.name().as_ref() {
                     b"arg" => SM(p, i, r),
                     b"request" if r.var == MessageVariant::Request => {
-                        i.messages.push(r);
+                        i.requests.push(r);
                         SI(p, i)
                     }
                     b"event" if r.var == MessageVariant::Event => {
-                        i.messages.push(r);
+                        i.events.push(r);
                         SI(p, i)
                     }
                     _ => perr!(SM(p, i, r), "</arg>, </request>, or </event>", e.name()),
@@ -362,7 +363,7 @@ pub fn parse(xml: &[u8]) -> Result<Protocol, ParseError> {
                 match e.name().as_ref() {
                     b"arg" => SM(p, i, v),
                     b"event" => {
-                        i.messages.push(v);
+                        i.events.push(v);
                         SI(p, i)
                     }
                     _ => perr!(SM(p, i, v), "</arg>, or </event>", e.name()),

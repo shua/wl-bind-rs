@@ -21,7 +21,8 @@ pub struct Interface {
     pub name: Vec<u8>,
     pub version: Vec<u8>,
     pub description: Vec<u8>,
-    pub messages: Vec<Message>,
+    pub events: Vec<Message>,
+    pub requests: Vec<Message>,
     pub enums: Vec<Enum>,
 }
 #[derive(Default)]
