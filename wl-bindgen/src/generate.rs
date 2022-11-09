@@ -69,7 +69,7 @@ fn ty_ident(arg: &Arg, req: bool) -> TokenStream {
             } else {
                 if req {
                     let gname = tok_id(&to_camelcase(str_(&arg.name)));
-                    quote! { #gname }
+                    quote! { (#gname, &'static std::ffi::CStr, u32) }
                 } else {
                     quote! { dyn Interface }
                 }
@@ -165,23 +165,18 @@ fn gen_args(m: &Message, opname: Ident) -> MsgGen {
     let mut dsr = Vec::with_capacity(m.args.len());
 
     req_new_id.push(quote! {
-        let cl = match self.cl.upgrade() {
-            Some(cl) => cl,
-            None => return Err(WlSerError::ClientUnavailable),
-        };
-        let mut cl = cl.borrow();
+        let cl = self.cl.upgrade().expect("client unavailable");
     });
 
     for a in &m.args {
         let name = tok_id(str_(&a.name));
-        let ret_name = tok_id(&format!("ret_{}", str_(&a.name)));
         let ty = ty_ident(a, false);
         let req_ty = ty_ident(a, true);
 
         match (a.r#type.as_slice(), a.allow_null) {
             (b"object" | b"new_id", false) => dsr.push(quote! {
                 let (#name, sz): (Option<#ty>, usize) = <Option<#ty> as WlDsr>::dsr(cl, buf, fdbuf)?;
-                let #name = #name.unwrap();
+                let #name = #name.expect("non-null object id");
                 let buf = &mut buf[sz..];
             }),
             _ => dsr.push(quote! {
@@ -190,13 +185,10 @@ fn gen_args(m: &Message, opname: Ident) -> MsgGen {
             })
         }
 
-        if a.r#type.as_slice() == b"new_id" && a.interface.is_none() {
-            ser.push(quote! { interface.ser(buf, fdbuf)?; });
-            ser.push(quote! { version.ser(buf, fdbuf)?; });
-        }
-        ser.push(quote! { #name.ser(buf, fdbuf)?; });
         arg_ty.req.push(name.clone(), req_ty.clone());
+
         if &a.r#type == b"new_id" {
+            let ret_name = tok_id(&format!("ret_{}", str_(&a.name)));
             if a.interface.is_some() {
                 req_new_id.push(quote! {
                     let #name = cl.new_id(#name);
@@ -204,21 +196,26 @@ fn gen_args(m: &Message, opname: Ident) -> MsgGen {
                 });
             } else {
                 let gname = tok_id(&to_camelcase(str_(&a.name)));
+                let name_i = tok_id(&format!("{}_interface", str_(&a.name)));
+                let name_v = tok_id(&format!("{}_version", str_(&a.name)));
 
-                arg_ty.enm.push(tok_id("interface"), quote! {  WlStr });
-                arg_ty.enm.push(tok_id("version"), quote! { u32 });
+                ser.push(quote! { #name_i.ser(buf, fdbuf).unwrap(); });
+                ser.push(quote! { #name_v.ser(buf, fdbuf).unwrap(); });
+
                 req_new_id.push(quote! {
-                    let interface : WlStr = <#gname as InterfaceDesc>::NAME.into();
-                    let version = <#gname as InterfaceDesc>::VERSION;
-                    let #name = cl.new_id(#name).as_dyn();
+                    let (#name, #name_i, #name_v) = (cl.new_id(#name.0).as_dyn(), #name.1.into(), #name.2);
                     let #ret_name = #name.clone();
                 });
 
-                arg_ty.gen.push(gname, quote! { Interface + InterfaceDesc });
+                arg_ty.enm.push(name_i, quote! {  WlStr });
+                arg_ty.enm.push(name_v, quote! { u32 });
+
+                arg_ty.gen.push(gname, quote! { Interface });
             }
             arg_ty.ret.push(ret_name.clone(), ty.clone());
         }
 
+        ser.push(quote! { #name.ser(buf, fdbuf).unwrap(); });
         arg_ty.enm.push(name, ty);
     }
 
@@ -296,15 +293,12 @@ fn gen_reqfn(
         pub fn #fnname #fngen (
             &self,
             #req_arg_ty
-        ) -> Result<(#(#req_ret_ty),*), WlSerError>
+        ) -> (#(#req_ret_ty),*)
         {
             #(#req_new_id)*
             let req = Request::#name{ #(#args),* };
-            if wayland_debug_enabled() {
-                println!("[{}] -> {req:?}", timestamp());
-            }
-            cl.send(self, req)?;
-            Ok((#(#req_ret_val),*))
+            cl.send(self, req).expect("send request");
+            (#(#req_ret_val),*)
         }
     });
 }
@@ -362,7 +356,7 @@ fn gen_enum(n: &Enum, enms: &mut Vec<TokenStream>, opts: GenOptions<'_>) {
     if !n.bitfield {
         enms.push(quote! {
             #[repr(u32)]
-            #[derive(Debug, Clone, Copy)]
+            #[derive(Debug, Clone, Copy, PartialEq)]
             pub enum #name { #(#entries)* }
             impl TryFrom<u32> for #name {
                 type Error = ();
@@ -453,8 +447,8 @@ pub fn generate(p: &Protocol, options: GenOptions<'_>) -> TokenStream {
     } in interfaces
     {
         let iname = str_(&name);
+        let name_ty = tok_id(&to_camelcase(iname));
         let iversion: u32 = str_(&version).parse().unwrap();
-        let iobjname = tok_id(&to_camelcase(iname));
         let modname = quote::format_ident!("{iname}_v{iversion}");
         let idoc = str_(&description);
 
@@ -504,7 +498,7 @@ pub fn generate(p: &Protocol, options: GenOptions<'_>) -> TokenStream {
             let iname = tok_id(iname);
             quote! {
                 pub use #modname as #iname;
-                pub type #iobjname = #modname::Proxy;
+                pub use #modname::#name_ty;
             }
         } else {
             quote! {}
@@ -540,42 +534,49 @@ pub fn generate(p: &Protocol, options: GenOptions<'_>) -> TokenStream {
                     #(#rops)*
                 }
 
-                type EventHandler<T> = Box<dyn Fn(&T, &WlClient, Event) -> Result<(), WlHandleError>>;
-                pub struct Proxy {
-                    on_event: Option<EventHandler<Proxy>>,
+                type EventHandler<T> = Box<dyn Fn(WlRef<T>, Event) -> Result<(), WlHandleError>>;
+                pub struct #name_ty {
+                    on_event: Option<EventHandler<#name_ty>>,
                 }
 
-                impl Proxy {
-                    pub fn new(on_event: impl Fn(&Proxy, &WlClient, Event) -> Result<(), WlHandleError> + 'static) -> Proxy {
-                        Proxy{ on_event: Some(Box::new(on_event)) }
+                impl #name_ty {
+                    pub fn new(on_event: impl Fn(WlRef<#name_ty>, Event) -> Result<(), WlHandleError> + 'static) -> #name_ty {
+                        #name_ty{ on_event: Some(Box::new(on_event)) }
                     }
                 }
 
-                impl InterfaceDesc for Proxy {
+                impl InterfaceDesc for #name_ty {
                     type Request = Request;
                     type Event = Event;
                     const NAME: &'static std::ffi::CStr = unsafe { std::ffi::CStr::from_bytes_with_nul_unchecked(#name_null.as_bytes()) };
                     const VERSION: u32 = #iversion;
                 }
 
-                impl Interface for Proxy {
+                impl Interface for #name_ty {
                     fn handle(&self, cl: &WlClient, id: u32, op: u16, buf: &mut [u8], fdbuf: &mut Vec<RawFd>) -> Result<(), WlHandleError> {
                         let (event, _) = Event::dsr(cl, buf, fdbuf).map_err(WlHandleError::Deser)?;
                         if wayland_debug_enabled() {
-                            println!("[{}] {}@{id} <- {event:?}", timestamp(), <Proxy as InterfaceDesc>::NAME.to_str().unwrap());
+                            println!("[{}] {}@{id} <- {event:?}", timestamp(), self.name().to_str().unwrap());
                         }
                         match &self.on_event {
-                            Some(cb) => cb(self, cl, event),
+                            Some(cb) => cb(cl.make_ref(id).unwrap(), event),
                             None => Err(WlHandleError::Unhandled),
                         }
                     }
 
                     fn type_id(&self) -> std::any::TypeId {
-                        std::any::TypeId::of::<Proxy>()
+                        std::any::TypeId::of::<#name_ty>()
+                    }
+
+                    fn name(&self) -> &'static std::ffi::CStr {
+                        #name_ty::NAME
+                    }
+                    fn version(&self) -> u32 {
+                        #name_ty::VERSION
                     }
                 }
 
-                impl WlRef<Proxy> { #(#req_fns)* }
+                impl WlRef<#name_ty> { #(#req_fns)* }
 
                 impl WlDsr for Event {
                     fn dsr(

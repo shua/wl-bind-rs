@@ -22,7 +22,7 @@ pub struct WlClient {
     write: RefCell<BufStream>,
 
     display: WlRef<WlDisplay>,
-    registry: WlRef<WlRegistry>,
+    registry: RefCell<WlRef<WlRegistry>>,
 
     bound: RefCell<Vec<RefCell<Option<Box<dyn Interface>>>>>,
     new_ids: RefCell<Vec<Box<dyn Interface>>>,
@@ -53,8 +53,7 @@ impl WlClient {
     }
 
     fn print_error(
-        _: &WlDisplay,
-        _: &WlClient,
+        _: WlRef<WlDisplay>,
         object_id: WlRef<dyn Interface>,
         code: u32,
         message: WlStr,
@@ -66,98 +65,137 @@ impl WlClient {
         panic!("fatal error");
     }
 
-    pub fn new() -> std::io::Result<Rc<RefCell<WlClient>>> {
-        let display = WlDisplay::new(|display, cl, e| match e {
+    pub fn new() -> std::io::Result<Rc<WlClient>> {
+        let display = WlDisplay::new(|display, e| match e {
             wl_display::Event::Error {
                 object_id,
                 code,
                 message,
-            } => WlClient::print_error(display, cl, object_id, code, message),
+            } => WlClient::print_error(display, object_id, code, message),
             wl_display::Event::DeleteId { id } => {
-                cl.destroy(id);
+                display.cl.upgrade().unwrap().destroy(id);
                 Ok(())
             }
         });
-        let registry = WlRegistry::new(|reg: &_, cl, e| match e {
+        let registry = WlRegistry::new(|reg, e| match e {
             wl_registry::Event::Global {
                 name,
                 interface,
                 version,
-            } => Ok(cl.global(name, interface, version)),
-            wl_registry::Event::GlobalRemove { name } => Ok(cl.global_remove(name)),
+            } => Ok(reg.cl.upgrade().unwrap().global(name, interface, version)),
+            wl_registry::Event::GlobalRemove { name } => {
+                Ok(reg.cl.upgrade().unwrap().global_remove(name))
+            }
         });
 
         let sock = WlClient::find_socket()?;
         let write_sock = sock.try_clone().unwrap();
         sock.set_read_timeout(Some(std::time::Duration::from_secs(5)));
-        let cl = Rc::new_cyclic(|cl| {
-            RefCell::new(WlClient {
-                read: RefCell::new(BufStream {
-                    sock,
-                    buf: Vec::with_capacity(1024),
-                    fdbuf: Vec::with_capacity(4),
-                }),
-                write: RefCell::new(BufStream {
-                    sock: write_sock,
-                    buf: Vec::with_capacity(1024),
-                    fdbuf: Vec::with_capacity(4),
-                }),
 
-                display: WlRef {
-                    cl: cl.clone(),
-                    id: 1,
-                    marker: PhantomData,
-                },
-                registry: WlRef {
-                    cl: cl.clone(),
-                    id: 0,
-                    marker: PhantomData,
-                },
+        let cl: Rc<WlClient> = Rc::new_cyclic(|cl| WlClient {
+            read: RefCell::new(BufStream {
+                sock,
+                buf: Vec::with_capacity(1024),
+                fdbuf: Vec::with_capacity(4),
+            }),
+            write: RefCell::new(BufStream {
+                sock: write_sock,
+                buf: Vec::with_capacity(1024),
+                fdbuf: Vec::with_capacity(4),
+            }),
 
-                bound: RefCell::new(vec![RefCell::new(Some(Box::new(display)))]),
-                new_ids: RefCell::new(vec![]),
-                globals: RefCell::new(vec![]),
-            })
+            display: WlRef {
+                cl: cl.clone(),
+                id: 1,
+                marker: PhantomData,
+            },
+            registry: RefCell::new(WlRef {
+                cl: cl.clone(),
+                id: 0,
+                marker: PhantomData,
+            }),
+
+            bound: RefCell::new(vec![RefCell::new(Some(Box::new(display)))]),
+            new_ids: RefCell::new(vec![]),
+            globals: RefCell::new(vec![]),
         });
 
-        let registry = cl.borrow().display.get_registry(registry).unwrap();
-        cl.borrow_mut().registry = registry;
-        let cb = cl
-            .borrow()
-            .display
-            .sync(WlCallback::new(|me, cl, e| match e {
-                wl_callback::Event::Done { callback_data } => Ok(println!("done getting globals")),
-            }));
+        let registry = cl.display.get_registry(registry);
+        *cl.registry.borrow_mut() = registry;
+        cl.update_ids();
+
+        cl.sync();
         Ok(cl)
     }
 
-    pub fn bind_global<T>(&self, global: T) -> Result<WlRef<T>, WlSerError>
+    pub fn sync(&self) {
+        let done = Rc::new(RefCell::new(false));
+        let cb_done = done.clone();
+        let cb = self.display.sync(WlCallback::new(move |me, e| match e {
+            wl_callback::Event::Done { callback_data } => {
+                *cb_done.borrow_mut() = true;
+                Ok(())
+            }
+        }));
+        while !*done.borrow() {
+            self.poll(true);
+        }
+    }
+
+    pub fn bind_global<T>(&self, global: T) -> WlRef<T>
     where
         T: Interface,
         T: InterfaceDesc,
     {
-        let name = {
-            let name = &<T as InterfaceDesc>::NAME;
-            let version = <T as InterfaceDesc>::VERSION;
-            let globals = self.globals.borrow();
+        let version = global.version();
+        unsafe { self.bind_global_unversioned(global, Some(&[version])) }
+    }
 
-            if let Some((n, _, _)) = globals
-                .iter()
-                .find(|(_, i, v)| i.as_c_str() == *name && *v == version)
-            {
-                *n
+    pub unsafe fn bind_global_unversioned<T>(&self, global: T, versions: Option<&[u32]>) -> WlRef<T>
+    where
+        T: Interface,
+        T: InterfaceDesc,
+    {
+        let globals = self.globals.borrow();
+        let mut gname_matches: Vec<_> = globals
+            .iter()
+            .filter(|(_, i, _)| i.as_c_str() == global.name())
+            .collect();
+        let mut gmatches: Vec<_> = gname_matches
+            .iter()
+            .filter(|(_, _, v)| {
+                *v == global.version() || versions.map(|vs| vs.contains(v)).unwrap_or(true)
+            })
+            .collect();
+        if gmatches.len() == 0 {
+            panic!(
+                "cannot find matching global to bind for {}:{:?} in {:?}",
+                unsafe { std::str::from_utf8_unchecked(global.name().to_bytes()) },
+                versions,
+                gname_matches,
+            );
+        }
+
+        let (name, version) =
+            if let Some(niv) = gmatches.iter().find(|(_, _, v)| *v == global.version()) {
+                (niv.0, niv.2)
             } else {
-                return Err(WlSerError::BindWrongType);
-            }
-        };
+                gmatches.sort_by(|(_, _, v1), (_, _, v2)| v1.cmp(v2));
+                let last = gmatches.pop().unwrap();
+                (last.0, last.2)
+            };
+        if version != global.version() && wayland_debug_enabled() {
+            let name = unsafe { std::str::from_utf8_unchecked(global.name().to_bytes()) };
+            println!("[{}] version supported by server doesn't match version supported by client: server:{name}:{} client:{name}:{version}", timestamp(), global.version())
+        }
 
-        let registry = self.registry.clone();
-        let rdyn = registry.bind(name, global)?;
-        Ok(WlRef {
+        let gname = global.name();
+        let rdyn = self.registry.borrow().bind(name, (global, gname, version));
+        WlRef {
             cl: self.display.cl.clone(),
             id: rdyn.id,
             marker: PhantomData,
-        })
+        }
     }
 
     pub fn describe_globals(&self) -> Vec<(String, u32)> {
@@ -201,17 +239,21 @@ impl WlClient {
         println!();
     }
 
-    pub fn poll(&self, blocking: bool) -> Result<Option<()>, ()> {
+    pub fn poll(&self, blocking: bool) -> Option<()> {
         let mut bsock = &mut *self.read.borrow_mut();
-        bsock.sock.set_nonblocking(!blocking).map_err(|_| ())?;
+        bsock
+            .sock
+            .set_nonblocking(!blocking)
+            .expect("set nonblocking");
         const WORD_SZ: usize = std::mem::size_of::<u32>();
         const HDR_SZ: usize = WORD_SZ * 2;
         let buf_len = bsock.buf.len();
         let fdbuf_len = bsock.fdbuf.len();
 
-        let (bufn, fdbufn) = sockio::recvmsg(&mut bsock.sock, &mut bsock.buf, &mut bsock.fdbuf)?;
+        let (bufn, fdbufn) =
+            sockio::recvmsg(&mut bsock.sock, &mut bsock.buf, &mut bsock.fdbuf).expect("recvmsg");
         if bufn == 0 && fdbufn == 0 {
-            return Ok(None);
+            return None;
         }
 
         let mut i = 0;
@@ -245,7 +287,7 @@ impl WlClient {
 
             let buf = &mut buf[..sz];
             obj.handle(self, id, op, buf, &mut bsock.fdbuf)
-                .map_err(|e| eprintln!("handle err: {e:?}"))?;
+                .expect("handle");
         }
 
         // move unhandled bytes to front of buf, truncate
@@ -253,20 +295,7 @@ impl WlClient {
         bsock.buf.truncate(bsock.buf.len() - i);
         self.update_ids();
 
-        Ok(Some(()))
-    }
-
-    fn print_ids(&self) {
-        println!(
-            "ids: {}: {:?} (+{})",
-            self.bound.borrow().len(),
-            self.bound
-                .borrow()
-                .iter()
-                .map(|c| c.borrow().is_some())
-                .collect::<Vec<_>>(),
-            self.new_ids.borrow().len(),
-        );
+        Some(())
     }
 
     fn update_ids(&self) {
@@ -336,7 +365,7 @@ impl WlClient {
     }
 
     fn make_ref<T: 'static + ?Sized>(&self, id: u32) -> Option<WlRef<T>> {
-        let id_u: usize = id.try_into().unwrap();
+        let id_u: usize = (id - 1).try_into().unwrap();
         let hs = self.bound.borrow();
         let mut dyn_h = match hs.get(id_u).map(RefCell::borrow) {
             Some(r) => r,
@@ -362,7 +391,7 @@ impl WlClient {
 }
 
 pub struct WlRef<T: ?Sized> {
-    cl: std::rc::Weak<RefCell<WlClient>>,
+    cl: std::rc::Weak<WlClient>,
     id: u32,
     marker: PhantomData<T>,
 }
@@ -527,6 +556,13 @@ pub trait Interface: 'static {
     ) -> Result<(), WlHandleError>;
 
     fn type_id(&self) -> std::any::TypeId;
+
+    fn name(&self) -> &'static std::ffi::CStr {
+        unsafe { std::ffi::CStr::from_bytes_with_nul_unchecked(b"object\0") }
+    }
+    fn version(&self) -> u32 {
+        0
+    }
 }
 
 impl dyn Interface {
@@ -572,6 +608,12 @@ pub enum WlDsrError {
     MissingFd,
     Primitive(std::array::TryFromSliceError),
     UnrecognizedOpcode(u16),
+}
+
+impl From<RawFd> for WlFd {
+    fn from(value: RawFd) -> Self {
+        WlFd(value)
+    }
 }
 
 macro_rules! impl_dsr {
@@ -655,8 +697,6 @@ impl<T: 'static + ?Sized> WlDsr for Option<WlRef<T>> {
 #[derive(Debug)]
 pub enum WlSerError {
     InsufficientSpace(usize),
-    BindWrongType,
-    ClientUnavailable,
 }
 
 impl From<std::convert::Infallible> for WlSerError {
@@ -742,6 +782,33 @@ pub fn timestamp() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs()
+}
+
+struct RegOverride<T: Interface>(T, u32);
+
+impl<T: Interface> Interface for RegOverride<T> {
+    fn handle(
+        &self,
+        cl: &WlClient,
+        id: u32,
+        op: u16,
+        buf: &mut [u8],
+        fds: &mut Vec<RawFd>,
+    ) -> Result<(), WlHandleError> {
+        self.0.handle(cl, id, op, buf, fds)
+    }
+
+    fn type_id(&self) -> std::any::TypeId {
+        self.0.type_id()
+    }
+
+    fn name(&self) -> &'static std::ffi::CStr {
+        self.0.name()
+    }
+
+    fn version(&self) -> u32 {
+        self.1
+    }
 }
 
 include!(concat!(env!("OUT_DIR"), "/binding.rs"));
