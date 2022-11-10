@@ -5,34 +5,74 @@ use wl;
 fn main() {
     let cl = wl::WlClient::new().unwrap();
 
-    let compositor =
-        unsafe { cl.bind_global_unversioned(wl::WlCompositor::new(|_, e| match e {}), Some(&[4])) };
-    let wm_base = unsafe {
-        cl.bind_global_unversioned(
-            wl::XdgWmBase::new(|me, e| match e {
-                wl::xdg_wm_base::Event::Ping { serial } => {
-                    me.pong(serial);
-                    Ok(())
-                }
-            }),
-            None,
-        )
-    };
     let shm_fmts = Rc::new(RefCell::new(vec![]));
     let cb_shm_fmts = shm_fmts.clone();
-    let shm = cl.bind_global(wl::WlShm::new(move |_, e| match e {
-        wl::wl_shm::Event::Format { format } => {
-            cb_shm_fmts.borrow_mut().push(format);
-            Ok(())
-        }
-    }));
+    let globals = Rc::new(RefCell::new((
+        None::<wl::WlRef<wl::WlCompositor>>,
+        None::<wl::WlRef<wl::XdgWmBase>>,
+        None::<wl::WlRef<wl::WlShm>>,
+    )));
+    let cb_globals = globals.clone();
+    cl.display
+        .get_registry(wl::WlRegistry::new(move |reg, e| match e {
+            wl::wl_registry::Event::Global {
+                name,
+                interface,
+                version,
+            } => {
+                use wl::InterfaceDesc;
+                let mut gs = cb_globals.borrow_mut();
+                if interface.as_c_str() == wl::WlCompositor::NAME {
+                    gs.0.replace(reg.bind(name, (wl::WlCompositor::new(|_, _| Ok(())), version)));
+                } else if interface.as_c_str() == wl::XdgWmBase::NAME {
+                    gs.1.replace(reg.bind(
+                        name,
+                        (
+                            wl::XdgWmBase::new(|base, e| match e {
+                                wl::xdg_wm_base::Event::Ping { serial } => {
+                                    base.pong(serial);
+                                    Ok(())
+                                }
+                            }),
+                            version,
+                        ),
+                    ));
+                } else if interface.as_c_str() == wl::WlShm::NAME {
+                    let cb_shm_fmts = cb_shm_fmts.clone();
+                    gs.2.replace(reg.bind(
+                        name,
+                        (
+                            wl::WlShm::new(move |_, e| match e {
+                                wl::wl_shm::Event::Format { format } => {
+                                    cb_shm_fmts.borrow_mut().push(format);
+                                    Ok(())
+                                }
+                            }),
+                            version,
+                        ),
+                    ));
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }));
+
     cl.sync();
+
+    let (compositor, wm_base, shm) = {
+        let mut gs = globals.borrow_mut();
+        (
+            gs.0.take().expect("compositor is required"),
+            gs.1.take().expect("wm_base is required"),
+            gs.2.take().expect("shm is required"),
+        )
+    };
 
     if !shm_fmts.borrow().contains(&wl::wl_shm::Format::Argb8888) {
         panic!("server must support arg8888");
     }
 
-    //let pbuf = pixbuf::ShmPixelBuffer::new(shm, 300, 200);
+    let pbuf = pixbuf::ShmPixelBuffer::new(shm, 300, 200);
 
     let wl_surface = compositor.create_surface(wl::WlSurface::new(|_, e| match e {
         wl::wl_surface::Event::Enter { output } => Ok(()),

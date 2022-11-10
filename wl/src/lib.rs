@@ -11,22 +11,130 @@ use std::sync::{Once, RwLock};
 
 mod sockio;
 
-struct BufStream {
+pub struct BufStream {
     sock: UnixStream,
     buf: Vec<u8>,
     fdbuf: Vec<RawFd>,
 }
 
+// event handler needs &mut self, &mut writebuf
+//   self.data = new_data        <- uses &mut self
+//   self.other_ref.request(...) <- uses &mut writebuf
+// poll needs &mut readbuf, &mut senders, &mut writebuf
+//   obj = &mut senders[event_obj_id]
+//   obj.handle(event...)        <- dynamically uses &mut writebuf
+// request dispatch needs &self, &mut writebuf
+
 pub struct WlClient {
     read: RefCell<BufStream>,
-    write: RefCell<BufStream>,
+    write: Rc<RefCell<BufStream>>,
 
-    display: WlRef<WlDisplay>,
-    registry: RefCell<WlRef<WlRegistry>>,
+    pub display: WlRef<WlDisplay>,
 
-    bound: RefCell<Vec<RefCell<Option<Box<dyn Interface>>>>>,
-    new_ids: RefCell<Vec<Box<dyn Interface>>>,
+    ids: Rc<IdSpace>,
     globals: RefCell<Vec<(u32, WlStr, u32)>>,
+}
+
+pub struct IdSpace {
+    bound_tid: RefCell<Vec<std::any::TypeId>>,
+    bound: RefCell<Vec<RefCell<Option<Box<dyn Interface>>>>>,
+    created: RefCell<Vec<Box<dyn Interface>>>,
+    available: RefCell<Vec<usize>>,
+    me: std::rc::Weak<IdSpace>,
+}
+
+impl IdSpace {
+    pub fn with_mut_value(&self, id: u32, f: impl FnOnce(Option<&mut Box<dyn Interface>>)) {
+        let idx = usize::try_from(id - 1).unwrap();
+        let bound = self.bound.borrow();
+        if bound.len() > idx {
+            let rcell = &self.bound.borrow()[idx];
+            let mut rcell = rcell.borrow_mut();
+            let v = rcell.as_mut();
+            f(v);
+        } else if idx < bound.len() + self.created.borrow().len() {
+            let mut new_ids = self.created.borrow_mut();
+            let v = &mut new_ids[idx - bound.len()];
+            f(Some(v));
+        } else {
+            f(None);
+        }
+    }
+
+    pub fn with_value(&self, id: u32, f: impl FnOnce(Option<&Box<dyn Interface>>)) {
+        let idx = usize::try_from(id - 1).unwrap();
+        let bound = self.bound.borrow();
+        if bound.len() > idx {
+            let rcell = &self.bound.borrow()[idx];
+            let rcell = rcell.borrow();
+            let v = rcell.as_ref();
+            f(v);
+        } else if idx < bound.len() + self.created.borrow().len() {
+            let v = &self.created.borrow()[idx - bound.len()];
+            f(Some(v));
+        } else {
+            f(None);
+        }
+    }
+
+    pub fn type_matches(&self, id: u32, tid: &std::any::TypeId) -> bool {
+        let idx = usize::try_from(id - 1).unwrap();
+        let btids = self.bound_tid.borrow();
+        btids.get(idx).map(|objtid| objtid == tid).unwrap_or(false)
+    }
+
+    pub fn update_ids(&self) {
+        let new_ids = std::mem::replace(&mut *self.created.borrow_mut(), vec![]);
+        for h in new_ids.into_iter() {
+            self.bound.borrow_mut().push(RefCell::new(Some(h)));
+        }
+    }
+
+    pub fn new_id<T: Interface>(
+        &self,
+        mut init: T,
+        write_stream: std::rc::Weak<RefCell<BufStream>>,
+    ) -> WlRef<T> {
+        if let Some(i) = self.available.borrow_mut().pop() {
+            self.bound_tid.borrow_mut()[i] = init.type_id();
+            self.bound.borrow()[i].borrow_mut().replace(Box::new(init));
+            let r = WlRef {
+                wr: write_stream,
+                ids: self.me.clone(),
+                id: (i + 1).try_into().unwrap(),
+                marker: PhantomData,
+            };
+            return r;
+        }
+
+        let mut hs = self.created.borrow_mut();
+        let i = self.bound_tid.borrow().len();
+        self.bound_tid.borrow_mut().push(init.type_id());
+        hs.push(Box::new(init));
+        WlRef {
+            wr: write_stream,
+            ids: self.me.clone(),
+            id: (i + 1).try_into().unwrap(),
+            marker: PhantomData,
+        }
+    }
+
+    fn destroy(&self, id: u32) -> bool {
+        let mut hs = self.bound.borrow();
+        let idx: usize = (id - 1).try_into().unwrap();
+        match hs.get(idx) {
+            Some(v) => {
+                if v.borrow().is_some() {
+                    v.borrow_mut().take();
+                    self.available.borrow_mut().push(idx);
+                    true
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        }
+    }
 }
 
 impl WlClient {
@@ -73,24 +181,29 @@ impl WlClient {
                 message,
             } => WlClient::print_error(display, object_id, code, message),
             wl_display::Event::DeleteId { id } => {
-                display.cl.upgrade().unwrap().destroy(id);
+                if let Some(ids) = display.ids.upgrade() {
+                    ids.destroy(id);
+                }
                 Ok(())
-            }
-        });
-        let registry = WlRegistry::new(|reg, e| match e {
-            wl_registry::Event::Global {
-                name,
-                interface,
-                version,
-            } => Ok(reg.cl.upgrade().unwrap().global(name, interface, version)),
-            wl_registry::Event::GlobalRemove { name } => {
-                Ok(reg.cl.upgrade().unwrap().global_remove(name))
             }
         });
 
         let sock = WlClient::find_socket()?;
         let write_sock = sock.try_clone().unwrap();
         sock.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+        let write_stream = Rc::new(RefCell::new(BufStream {
+            sock: write_sock,
+            buf: Vec::with_capacity(1024),
+            fdbuf: Vec::with_capacity(4),
+        }));
+        let weak_write = Rc::downgrade(&write_stream);
+        let ids = Rc::new_cyclic(|me| IdSpace {
+            bound_tid: RefCell::new(vec![Interface::type_id(&display)]),
+            bound: RefCell::new(vec![RefCell::new(Some(Box::new(display)))]),
+            created: RefCell::new(vec![]),
+            available: RefCell::new(vec![]),
+            me: me.clone(),
+        });
 
         let cl: Rc<WlClient> = Rc::new_cyclic(|cl| WlClient {
             read: RefCell::new(BufStream {
@@ -98,31 +211,20 @@ impl WlClient {
                 buf: Vec::with_capacity(1024),
                 fdbuf: Vec::with_capacity(4),
             }),
-            write: RefCell::new(BufStream {
-                sock: write_sock,
-                buf: Vec::with_capacity(1024),
-                fdbuf: Vec::with_capacity(4),
-            }),
+            write: write_stream,
 
             display: WlRef {
-                cl: cl.clone(),
+                wr: weak_write.clone(),
+                ids: Rc::downgrade(&ids),
                 id: 1,
                 marker: PhantomData,
             },
-            registry: RefCell::new(WlRef {
-                cl: cl.clone(),
-                id: 0,
-                marker: PhantomData,
-            }),
 
-            bound: RefCell::new(vec![RefCell::new(Some(Box::new(display)))]),
-            new_ids: RefCell::new(vec![]),
+            ids,
             globals: RefCell::new(vec![]),
         });
 
-        let registry = cl.display.get_registry(registry);
-        *cl.registry.borrow_mut() = registry;
-        cl.update_ids();
+        cl.ids.update_ids();
 
         cl.sync();
         Ok(cl)
@@ -142,62 +244,6 @@ impl WlClient {
         }
     }
 
-    pub fn bind_global<T>(&self, global: T) -> WlRef<T>
-    where
-        T: Interface,
-        T: InterfaceDesc,
-    {
-        let version = global.version();
-        unsafe { self.bind_global_unversioned(global, Some(&[version])) }
-    }
-
-    pub unsafe fn bind_global_unversioned<T>(&self, global: T, versions: Option<&[u32]>) -> WlRef<T>
-    where
-        T: Interface,
-        T: InterfaceDesc,
-    {
-        let globals = self.globals.borrow();
-        let mut gname_matches: Vec<_> = globals
-            .iter()
-            .filter(|(_, i, _)| i.as_c_str() == global.name())
-            .collect();
-        let mut gmatches: Vec<_> = gname_matches
-            .iter()
-            .filter(|(_, _, v)| {
-                *v == global.version() || versions.map(|vs| vs.contains(v)).unwrap_or(true)
-            })
-            .collect();
-        if gmatches.len() == 0 {
-            panic!(
-                "cannot find matching global to bind for {}:{:?} in {:?}",
-                unsafe { std::str::from_utf8_unchecked(global.name().to_bytes()) },
-                versions,
-                gname_matches,
-            );
-        }
-
-        let (name, version) =
-            if let Some(niv) = gmatches.iter().find(|(_, _, v)| *v == global.version()) {
-                (niv.0, niv.2)
-            } else {
-                gmatches.sort_by(|(_, _, v1), (_, _, v2)| v1.cmp(v2));
-                let last = gmatches.pop().unwrap();
-                (last.0, last.2)
-            };
-        if version != global.version() && wayland_debug_enabled() {
-            let name = unsafe { std::str::from_utf8_unchecked(global.name().to_bytes()) };
-            println!("[{}] version supported by server doesn't match version supported by client: server:{name}:{} client:{name}:{version}", timestamp(), global.version())
-        }
-
-        let gname = global.name();
-        let rdyn = self.registry.borrow().bind(name, (global, gname, version));
-        WlRef {
-            cl: self.display.cl.clone(),
-            id: rdyn.id,
-            marker: PhantomData,
-        }
-    }
-
     pub fn describe_globals(&self) -> Vec<(String, u32)> {
         let globals = self.globals.borrow();
         globals
@@ -207,7 +253,7 @@ impl WlClient {
             .collect()
     }
 
-    fn send<T>(&self, r: &WlRef<T>, req: T::Request) -> Result<(), WlSerError>
+    fn send<T>(bsock: &mut BufStream, r: &WlRef<T>, req: T::Request) -> Result<(), WlSerError>
     where
         T: InterfaceDesc,
         WlRef<T>: std::fmt::Debug,
@@ -217,7 +263,6 @@ impl WlClient {
             println!("[{}] {:?} -> {:?}", timestamp(), r, req);
         }
 
-        let bsock = &mut *self.write.borrow_mut();
         bsock.buf.truncate(0);
         bsock.buf.extend(r.id.to_ne_bytes());
         req.ser(&mut bsock.buf, &mut bsock.fdbuf)?;
@@ -258,7 +303,7 @@ impl WlClient {
 
         let mut i = 0;
         while bsock.buf[i..].len() > HDR_SZ {
-            self.update_ids();
+            self.ids.update_ids();
             let buf = &mut bsock.buf[i..];
             let id = u32::from_ne_bytes(buf[..WORD_SZ].try_into().unwrap());
             let (sz, op): (usize, u16) = {
@@ -273,59 +318,27 @@ impl WlClient {
             }
             i += sz;
 
-            let objid: usize = usize::try_from(id).unwrap();
-            let hborrow = self.bound.borrow();
-            let obj = hborrow.get(objid - 1).map(RefCell::borrow);
-            let obj = match obj {
-                Some(obj) if obj.is_some() => obj,
-                _ => {
-                    eprintln!("message for non-existent object (@{id})");
-                    continue;
-                }
-            };
-            let obj = obj.as_ref().unwrap();
+            self.ids.with_mut_value(id, |obj| {
+                let obj = match obj {
+                    Some(obj) => obj,
+                    _ => {
+                        eprintln!("message for non-existent object (@{id})");
+                        return;
+                    }
+                };
 
-            let buf = &mut buf[..sz];
-            obj.handle(self, id, op, buf, &mut bsock.fdbuf)
-                .expect("handle");
+                let buf = &mut buf[..sz];
+                obj.handle_event(self, id, buf, &mut bsock.fdbuf)
+                    .expect("handle");
+            });
         }
 
         // move unhandled bytes to front of buf, truncate
         bsock.buf.copy_within(i.., 0);
         bsock.buf.truncate(bsock.buf.len() - i);
-        self.update_ids();
+        self.ids.update_ids();
 
         Some(())
-    }
-
-    fn update_ids(&self) {
-        let new_ids = std::mem::replace(&mut *self.new_ids.borrow_mut(), vec![]);
-        for h in new_ids.into_iter() {
-            self.bound.borrow_mut().push(RefCell::new(Some(h)));
-        }
-    }
-
-    pub fn new_id<T: Interface>(&self, mut init: T) -> WlRef<T> {
-        let mut hs = self.bound.borrow();
-        if let Some((i, v)) = hs.iter().enumerate().find(|(_, v)| (*v).borrow().is_none()) {
-            v.borrow_mut().replace(Box::new(init));
-            let r = WlRef {
-                cl: self.display.cl.clone(),
-                id: (i + 1).try_into().unwrap(),
-                marker: PhantomData,
-            };
-            return r;
-        }
-
-        let i = hs.len();
-        let mut hs = self.new_ids.borrow_mut();
-        let i = i + hs.len();
-        hs.push(Box::new(init));
-        WlRef {
-            cl: self.display.cl.clone(),
-            id: (i + 1).try_into().unwrap(),
-            marker: PhantomData,
-        }
     }
 
     pub fn global(&self, name: u32, interface: WlStr, version: u32) {
@@ -347,42 +360,23 @@ impl WlClient {
         }
     }
 
-    fn destroy(&self, id: u32) -> bool {
-        let mut hs = self.bound.borrow();
-        let id: usize = id.try_into().unwrap();
-        match hs.get(id - 1) {
-            Some(v) => {
-                let mut v = v.borrow_mut();
-                if v.is_some() {
-                    v.take();
-                    true
-                } else {
-                    false
-                }
-            }
-            _ => false,
-        }
+    fn make_ref<T: Interface>(&self, id: u32) -> Option<WlRef<T>> {
+        WlClient::static_make_ref(&self.ids, Rc::downgrade(&self.write), id)
     }
 
-    fn make_ref<T: 'static + ?Sized>(&self, id: u32) -> Option<WlRef<T>> {
-        let id_u: usize = (id - 1).try_into().unwrap();
-        let hs = self.bound.borrow();
-        let mut dyn_h = match hs.get(id_u).map(RefCell::borrow) {
-            Some(r) => r,
-            None => {
-                eprintln!("handlers[{id}] not initialized");
-                return None;
-            }
-        };
-        let dyn_h = dyn_h.as_ref()?;
+    fn static_make_ref<T: Interface + ?Sized>(
+        ids: &IdSpace,
+        write_stream: std::rc::Weak<RefCell<BufStream>>,
+        id: u32,
+    ) -> Option<WlRef<T>> {
         let ttid = std::any::TypeId::of::<T>();
-        let concrete = (&**dyn_h).type_id();
-        if ttid == std::any::TypeId::of::<dyn Interface>() || concrete == ttid {
-            let marker = PhantomData;
+        let dyntid = std::any::TypeId::of::<dyn Interface>();
+        if ttid == dyntid || ids.type_matches(id, &ttid) {
             Some(WlRef {
-                cl: self.display.cl.clone(),
+                wr: write_stream.clone(),
+                ids: ids.me.clone(),
                 id,
-                marker,
+                marker: PhantomData,
             })
         } else {
             None
@@ -391,7 +385,8 @@ impl WlClient {
 }
 
 pub struct WlRef<T: ?Sized> {
-    cl: std::rc::Weak<WlClient>,
+    wr: std::rc::Weak<RefCell<BufStream>>,
+    ids: std::rc::Weak<IdSpace>,
     id: u32,
     marker: PhantomData<T>,
 }
@@ -399,7 +394,8 @@ pub struct WlRef<T: ?Sized> {
 impl<T: ?Sized> Clone for WlRef<T> {
     fn clone(&self) -> Self {
         WlRef {
-            cl: self.cl.clone(),
+            wr: self.wr.clone(),
+            ids: self.ids.clone(),
             id: self.id,
             marker: self.marker,
         }
@@ -423,7 +419,8 @@ where
 impl<T: Interface> WlRef<T> {
     fn as_dyn(self) -> WlRef<dyn Interface> {
         WlRef {
-            cl: self.cl,
+            wr: self.wr,
+            ids: self.ids,
             id: self.id,
             marker: PhantomData,
         }
@@ -538,6 +535,11 @@ macro_rules! delegate_op {
 }
 delegate_op! { WlFixed Neg::neg() Add::add(rhs) Sub::sub(rhs) }
 
+pub trait Handler {
+    type Event: WlDsr;
+    fn on_event(me: WlRef<Self>, event: Self::Event) -> Result<(), WlHandleError>;
+}
+
 pub trait InterfaceDesc {
     type Request: WlSer;
     type Event: WlDsr;
@@ -546,11 +548,10 @@ pub trait InterfaceDesc {
 }
 
 pub trait Interface: 'static {
-    fn handle(
-        &self,
+    fn handle_event(
+        &mut self,
         cl: &WlClient,
         id: u32,
-        op: u16,
         buf: &mut [u8],
         fds: &mut Vec<RawFd>,
     ) -> Result<(), WlHandleError>;
@@ -593,7 +594,8 @@ fn wayland_debug_enabled() -> bool {
 
 pub trait WlDsr: Sized {
     fn dsr(
-        cl: &WlClient,
+        ids: &IdSpace,
+        write_stream: &std::rc::Weak<RefCell<BufStream>>,
         buf: &mut [u8],
         fdbuf: &mut Vec<RawFd>,
     ) -> Result<(Self, usize), WlDsrError>;
@@ -620,7 +622,8 @@ macro_rules! impl_dsr {
     ($t:ty) => {
         impl WlDsr for $t {
             fn dsr(
-                cl: &WlClient,
+                ids: &IdSpace,
+                write_stream: &std::rc::Weak<RefCell<BufStream>>,
                 buf: &mut [u8],
                 fdbuf: &mut Vec<RawFd>,
             ) -> Result<(Self, usize), WlDsrError> {
@@ -638,11 +641,12 @@ impl_dsr! { WlFixed }
 
 impl WlDsr for WlArray {
     fn dsr(
-        cl: &WlClient,
+        ids: &IdSpace,
+        write_stream: &std::rc::Weak<RefCell<BufStream>>,
         buf: &mut [u8],
         fdbuf: &mut Vec<RawFd>,
     ) -> Result<(Self, usize), WlDsrError> {
-        let (z, n) = u32::dsr(cl, buf, fdbuf)?;
+        let (z, n) = u32::dsr(ids, write_stream, buf, fdbuf)?;
         let z = usize::try_from(z).unwrap();
         Ok((buf[n..(n + z)].to_vec(), ((n + z) + 0x3) & !0x3))
     }
@@ -650,18 +654,20 @@ impl WlDsr for WlArray {
 
 impl WlDsr for WlStr {
     fn dsr(
-        cl: &WlClient,
+        ids: &IdSpace,
+        write_stream: &std::rc::Weak<RefCell<BufStream>>,
         buf: &mut [u8],
         fdbuf: &mut Vec<RawFd>,
     ) -> Result<(Self, usize), WlDsrError> {
-        let (arr, sz) = WlArray::dsr(cl, buf, fdbuf)?;
+        let (arr, sz) = WlArray::dsr(ids, write_stream, buf, fdbuf)?;
         Ok((std::ffi::CString::from_vec_with_nul(arr).unwrap(), sz))
     }
 }
 
 impl WlDsr for WlFd {
     fn dsr(
-        cl: &WlClient,
+        ids: &IdSpace,
+        write_stream: &std::rc::Weak<RefCell<BufStream>>,
         buf: &mut [u8],
         fdbuf: &mut Vec<RawFd>,
     ) -> Result<(Self, usize), WlDsrError> {
@@ -672,25 +678,30 @@ impl WlDsr for WlFd {
     }
 }
 
-impl<T: 'static + ?Sized> WlDsr for WlRef<T> {
+impl<T: Interface + ?Sized> WlDsr for WlRef<T> {
     fn dsr(
-        cl: &WlClient,
+        ids: &IdSpace,
+        write_stream: &std::rc::Weak<RefCell<BufStream>>,
         buf: &mut [u8],
         fdbuf: &mut Vec<RawFd>,
     ) -> Result<(Self, usize), WlDsrError> {
-        let (id, sz) = u32::dsr(cl, buf, fdbuf)?;
-        Ok((cl.make_ref(id).expect("null ref"), sz))
+        let (id, sz) = u32::dsr(ids, write_stream, buf, fdbuf)?;
+        Ok((
+            WlClient::static_make_ref(ids, write_stream.clone(), id).expect("null ref"),
+            sz,
+        ))
     }
 }
 
-impl<T: 'static + ?Sized> WlDsr for Option<WlRef<T>> {
+impl<T: Interface + ?Sized> WlDsr for Option<WlRef<T>> {
     fn dsr(
-        cl: &WlClient,
+        ids: &IdSpace,
+        write_stream: &std::rc::Weak<RefCell<BufStream>>,
         buf: &mut [u8],
         fdbuf: &mut Vec<RawFd>,
     ) -> Result<(Self, usize), WlDsrError> {
-        let (id, sz) = u32::dsr(cl, buf, fdbuf)?;
-        Ok((cl.make_ref(id), sz))
+        let (id, sz) = u32::dsr(ids, write_stream, buf, fdbuf)?;
+        Ok((WlClient::static_make_ref(ids, write_stream.clone(), id), sz))
     }
 }
 
@@ -782,33 +793,6 @@ pub fn timestamp() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs()
-}
-
-struct RegOverride<T: Interface>(T, u32);
-
-impl<T: Interface> Interface for RegOverride<T> {
-    fn handle(
-        &self,
-        cl: &WlClient,
-        id: u32,
-        op: u16,
-        buf: &mut [u8],
-        fds: &mut Vec<RawFd>,
-    ) -> Result<(), WlHandleError> {
-        self.0.handle(cl, id, op, buf, fds)
-    }
-
-    fn type_id(&self) -> std::any::TypeId {
-        self.0.type_id()
-    }
-
-    fn name(&self) -> &'static std::ffi::CStr {
-        self.0.name()
-    }
-
-    fn version(&self) -> u32 {
-        self.1
-    }
 }
 
 include!(concat!(env!("OUT_DIR"), "/binding.rs"));

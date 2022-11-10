@@ -30,6 +30,76 @@ fn to_camelcase(s: &str) -> String {
     r
 }
 
+impl Arg {
+    fn ty_ident(&self, req: bool, ret: bool) -> TokenStream {
+        if let Some(ref ename) = self.r#enum {
+            let (ns, ename) = ns_split(ename);
+            let ename = tok_id(&to_camelcase(ename));
+            if let Some(ns) = ns {
+                return quote!(#ns::#ename);
+            } else {
+                return quote!(#ename);
+            }
+        }
+
+        match self.r#type.as_slice() {
+            b"object" | b"new_id" => {
+                let mut iname = if let Some(ref iname) = self.interface {
+                    let (ns, iname) = ns_split(iname);
+                    let iname = tok_id(&to_camelcase(iname));
+                    if let Some(ns) = ns {
+                        quote! { #ns::#iname }
+                    } else {
+                        quote! { #iname }
+                    }
+                } else {
+                    let gname = tok_id(&to_camelcase(str_(&self.name)));
+                    match (req, ret) {
+                        (true, false) => {
+                            quote! { (#gname, u32) }
+                        }
+                        (true, true) => {
+                            quote! { #gname }
+                        }
+                        (false, _) => {
+                            quote! { dyn Interface }
+                        }
+                    }
+                };
+                if !req || ret || self.r#type != b"new_id" {
+                    iname = quote! { WlRef<#iname> };
+                }
+                if self.allow_null {
+                    iname = quote! { Option<#iname> };
+                }
+                match self.r#type.as_slice() {
+                    b"new_id" => iname,
+                    b"object" => iname,
+                    _ => unreachable!("already limited cases in outer match"),
+                }
+            }
+            b"int" => quote! { i32 },
+            b"uint" => quote! { u32 },
+            b"fixed" => quote! { WlFixed },
+            b"string" => quote! { WlStr },
+            b"array" => quote! { WlArray },
+            b"fd" => quote! { WlFd },
+            _ => panic!("unexpected arg type: {}", str_(&self.r#type)),
+        }
+    }
+    fn struct_ty_ident(&self) -> TokenStream {
+        self.ty_ident(false, false)
+    }
+
+    fn req_ty_ident(&self) -> TokenStream {
+        self.ty_ident(true, false)
+    }
+
+    fn req_ret_ty_ident(&self) -> TokenStream {
+        self.ty_ident(true, true)
+    }
+}
+
 fn ns_split(s: &[u8]) -> (Option<TokenStream>, &str) {
     let mut parts: Vec<_> = s.split(|&b| b == b'.').map(str_).collect();
     let last = parts
@@ -43,57 +113,6 @@ fn ns_split(s: &[u8]) -> (Option<TokenStream>, &str) {
         }
     });
     (ns, last)
-}
-
-fn ty_ident(arg: &Arg, req: bool) -> TokenStream {
-    if let Some(ref ename) = arg.r#enum {
-        let (ns, ename) = ns_split(ename);
-        let ename = tok_id(&to_camelcase(ename));
-        if let Some(ns) = ns {
-            return quote!(#ns::#ename);
-        } else {
-            return quote!(#ename);
-        }
-    }
-
-    match arg.r#type.as_slice() {
-        b"object" | b"new_id" => {
-            let mut iname = if let Some(ref iname) = arg.interface {
-                let (ns, iname) = ns_split(iname);
-                let iname = tok_id(&to_camelcase(iname));
-                if let Some(ns) = ns {
-                    quote! { #ns::#iname }
-                } else {
-                    quote! { #iname }
-                }
-            } else {
-                if req {
-                    let gname = tok_id(&to_camelcase(str_(&arg.name)));
-                    quote! { (#gname, &'static std::ffi::CStr, u32) }
-                } else {
-                    quote! { dyn Interface }
-                }
-            };
-            if !req || arg.r#type != b"new_id" {
-                iname = quote! { WlRef<#iname> };
-            }
-            if arg.allow_null {
-                iname = quote! { Option<#iname> };
-            }
-            match arg.r#type.as_slice() {
-                b"new_id" => iname,
-                b"object" => iname,
-                _ => unreachable!("already limited cases in outer match"),
-            }
-        }
-        b"int" => quote! { i32 },
-        b"uint" => quote! { u32 },
-        b"fixed" => quote! { WlFixed },
-        b"string" => quote! { WlStr },
-        b"array" => quote! { WlArray },
-        b"fd" => quote! { WlFd },
-        _ => panic!("unexpected arg type: {}", str_(&arg.r#type)),
-    }
 }
 
 fn gen_opname(m: &Message, ops: &mut Vec<TokenStream>) -> Ident {
@@ -164,34 +183,29 @@ fn gen_args(m: &Message, opname: Ident) -> MsgGen {
     let mut ser = Vec::with_capacity(m.args.len());
     let mut dsr = Vec::with_capacity(m.args.len());
 
-    req_new_id.push(quote! {
-        let cl = self.cl.upgrade().expect("client unavailable");
-    });
-
     for a in &m.args {
         let name = tok_id(str_(&a.name));
-        let ty = ty_ident(a, false);
-        let req_ty = ty_ident(a, true);
+        let ty = a.struct_ty_ident();
 
         match (a.r#type.as_slice(), a.allow_null) {
             (b"object" | b"new_id", false) => dsr.push(quote! {
-                let (#name, sz): (Option<#ty>, usize) = <Option<#ty> as WlDsr>::dsr(cl, buf, fdbuf)?;
+                let (#name, sz): (Option<#ty>, usize) = <Option<#ty> as WlDsr>::dsr(ids, write_stream, buf, fdbuf)?;
                 let #name = #name.expect("non-null object id");
                 let buf = &mut buf[sz..];
             }),
             _ => dsr.push(quote! {
-                let (#name, sz): (#ty, usize) = <#ty as WlDsr>::dsr(cl, buf, fdbuf)?;
+                let (#name, sz): (#ty, usize) = <#ty as WlDsr>::dsr(ids, write_stream, buf, fdbuf)?;
                 let buf = &mut buf[sz..];
             })
         }
 
-        arg_ty.req.push(name.clone(), req_ty.clone());
+        arg_ty.req.push(name.clone(), a.req_ty_ident());
 
         if &a.r#type == b"new_id" {
             let ret_name = tok_id(&format!("ret_{}", str_(&a.name)));
             if a.interface.is_some() {
                 req_new_id.push(quote! {
-                    let #name = cl.new_id(#name);
+                    let #name = ids.new_id(#name, self.wr.clone());
                     let #ret_name = #name.clone();
                 });
             } else {
@@ -203,16 +217,20 @@ fn gen_args(m: &Message, opname: Ident) -> MsgGen {
                 ser.push(quote! { #name_v.ser(buf, fdbuf).unwrap(); });
 
                 req_new_id.push(quote! {
-                    let (#name, #name_i, #name_v) = (cl.new_id(#name.0).as_dyn(), #name.1.into(), #name.2);
-                    let #ret_name = #name.clone();
+                    let #name_i = #name.0.name().into();
+                    let (#ret_name, #name_v) = (
+                        ids.new_id(#name.0, self.wr.clone()),
+                        #name.1,
+                    );
+                    let #name = #ret_name.clone().as_dyn();
                 });
 
-                arg_ty.enm.push(name_i, quote! {  WlStr });
+                arg_ty.enm.push(name_i, quote! { WlStr });
                 arg_ty.enm.push(name_v, quote! { u32 });
 
                 arg_ty.gen.push(gname, quote! { Interface });
             }
-            arg_ty.ret.push(ret_name.clone(), ty.clone());
+            arg_ty.ret.push(ret_name.clone(), a.req_ret_ty_ident());
         }
 
         ser.push(quote! { #name.ser(buf, fdbuf).unwrap(); });
@@ -295,9 +313,13 @@ fn gen_reqfn(
             #req_arg_ty
         ) -> (#(#req_ret_ty),*)
         {
+            let ids = self.ids.upgrade().expect("ids unavailable");
             #(#req_new_id)*
             let req = Request::#name{ #(#args),* };
-            cl.send(self, req).expect("send request");
+
+            let wr = self.wr.upgrade().expect("write buf unavailable");
+            let mut wr = wr.borrow_mut();
+            WlClient::send(&mut *wr, self, req).expect("send request");
             (#(#req_ret_val),*)
         }
     });
@@ -340,8 +362,13 @@ fn gen_enum(n: &Enum, enms: &mut Vec<TokenStream>, opts: GenOptions<'_>) {
 
     let dsr_ser = quote! {
         impl WlDsr for #name {
-            fn dsr(cl: &WlClient, buf: &mut [u8], fdbuf: &mut Vec<RawFd>) -> Result<(Self, usize), WlDsrError> {
-                let (n, sz) = u32::dsr(cl, buf, fdbuf)?;
+            fn dsr(
+                ids: &IdSpace,
+                write_stream: &std::rc::Weak<RefCell<BufStream>>,
+                buf: &mut [u8],
+                fdbuf: &mut Vec<RawFd>
+            ) -> Result<(Self, usize), WlDsrError> {
+                let (n, sz) = u32::dsr(ids, write_stream, buf, fdbuf)?;
                 Ok((n.try_into().unwrap(), sz))
             }
         }
@@ -534,14 +561,13 @@ pub fn generate(p: &Protocol, options: GenOptions<'_>) -> TokenStream {
                     #(#rops)*
                 }
 
-                type EventHandler<T> = Box<dyn Fn(WlRef<T>, Event) -> Result<(), WlHandleError>>;
-                pub struct #name_ty {
-                    on_event: Option<EventHandler<#name_ty>>,
-                }
+                pub struct #name_ty (
+                    Box<dyn FnMut(WlRef<#name_ty>, Event) -> Result<(), WlHandleError>>,
+                );
 
                 impl #name_ty {
-                    pub fn new(on_event: impl Fn(WlRef<#name_ty>, Event) -> Result<(), WlHandleError> + 'static) -> #name_ty {
-                        #name_ty{ on_event: Some(Box::new(on_event)) }
+                    pub fn new(on_event: impl FnMut(WlRef<#name_ty>, Event) -> Result<(), WlHandleError> + 'static) -> #name_ty {
+                        #name_ty(Box::new(on_event))
                     }
                 }
 
@@ -553,15 +579,17 @@ pub fn generate(p: &Protocol, options: GenOptions<'_>) -> TokenStream {
                 }
 
                 impl Interface for #name_ty {
-                    fn handle(&self, cl: &WlClient, id: u32, op: u16, buf: &mut [u8], fdbuf: &mut Vec<RawFd>) -> Result<(), WlHandleError> {
-                        let (event, _) = Event::dsr(cl, buf, fdbuf).map_err(WlHandleError::Deser)?;
+                    fn handle_event(&mut self, cl: &WlClient, id: u32, buf: &mut [u8], fdbuf: &mut Vec<RawFd>) -> Result<(), WlHandleError> {
+                        let wr = Rc::downgrade(&cl.write);
+                        let (event, _) = Event::dsr(&cl.ids, &wr, buf, fdbuf)
+                            .map_err(WlHandleError::Deser)?;
                         if wayland_debug_enabled() {
                             println!("[{}] {}@{id} <- {event:?}", timestamp(), self.name().to_str().unwrap());
                         }
-                        match &self.on_event {
-                            Some(cb) => cb(cl.make_ref(id).unwrap(), event),
-                            None => Err(WlHandleError::Unhandled),
-                        }
+                        (self.0)(
+                            WlClient::static_make_ref(&cl.ids, wr, id).unwrap(),
+                            event,
+                        )
                     }
 
                     fn type_id(&self) -> std::any::TypeId {
@@ -580,7 +608,8 @@ pub fn generate(p: &Protocol, options: GenOptions<'_>) -> TokenStream {
 
                 impl WlDsr for Event {
                     fn dsr(
-                        cl: &WlClient,
+                        ids: &IdSpace,
+                        write_stream: &std::rc::Weak<RefCell<BufStream>>,
                         buf: &mut [u8],
                         fdbuf: &mut Vec<RawFd>,
                     ) -> Result<(Self, usize), WlDsrError> {
