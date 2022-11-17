@@ -2,122 +2,199 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use wl;
 
+struct InitData<const GLOBALS: usize> {
+    versions: [(&'static str, u32, u32, u32); GLOBALS],
+    shm_has_argb8888: bool,
+    has_pointer_caps: bool,
+}
+impl<const GLOBALS: usize> InitData<GLOBALS> {
+    fn new(versions: [(&'static str, u32, u32, u32); GLOBALS]) -> Self {
+        InitData {
+            versions,
+            shm_has_argb8888: false,
+            has_pointer_caps: false,
+        }
+    }
+}
+
+impl<const GLOBALS: usize> wl::wl_registry::EventHandler for InitData<GLOBALS> {
+    fn on_global(
+        &mut self,
+        _: wl::WlRef<wl::WlRegistry>,
+        name: u32,
+        interface: String,
+        version: u32,
+    ) -> Result<(), wl::WlHandleError> {
+        if let Some((_, n, v, _)) = self
+            .versions
+            .iter_mut()
+            .find(|(i, _, vl, vr)| *i == interface && (*vl..=*vr).contains(&version))
+        {
+            *n = name;
+            *v = version;
+        }
+        Ok(())
+    }
+}
+
+impl<const GLOBALS: usize> wl::wl_shm::EventHandler for InitData<GLOBALS> {
+    fn on_format(
+        &mut self,
+        _: wl::WlRef<wl::WlShm>,
+        format: wl::wl_shm::Format,
+    ) -> Result<(), wl::WlHandleError> {
+        if format == wl::wl_shm::Format::Argb8888 {
+            self.shm_has_argb8888 = true;
+        }
+        Ok(())
+    }
+}
+
+impl<const GLOBALS: usize> wl::wl_seat::EventHandler for InitData<GLOBALS> {
+    fn on_capabilities(
+        &mut self,
+        _: wl::WlRef<wl::WlSeat>,
+        capabilities: wl::wl_seat::Capability,
+    ) -> Result<(), wl::WlHandleError> {
+        if (wl::wl_seat::Capability::POINTER & u32::from(capabilities)) != 0 {
+            self.has_pointer_caps = true;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct App {
+    done: bool,
+    surface_configured: bool,
+    dirty: bool,
+}
+
 fn main() {
     let cl = wl::WlClient::new().unwrap();
 
-    let shm_fmts = Rc::new(RefCell::new(vec![]));
-    let cb_shm_fmts = shm_fmts.clone();
-    let globals = Rc::new(RefCell::new((
-        None::<wl::WlRef<wl::WlCompositor>>,
-        None::<wl::WlRef<wl::XdgWmBase>>,
-        None::<wl::WlRef<wl::WlShm>>,
-    )));
-    let cb_globals = globals.clone();
-    cl.display
-        .get_registry(wl::WlRegistry::new(move |reg, e| match e {
-            wl::wl_registry::Event::Global {
-                name,
-                interface,
-                version,
-            } => {
-                use wl::InterfaceDesc;
-                let mut gs = cb_globals.borrow_mut();
-                if interface.as_c_str() == wl::WlCompositor::NAME {
-                    gs.0.replace(reg.bind(name, (wl::WlCompositor::new(|_, _| Ok(())), version)));
-                } else if interface.as_c_str() == wl::XdgWmBase::NAME {
-                    gs.1.replace(reg.bind(
-                        name,
-                        (
-                            wl::XdgWmBase::new(|base, e| match e {
-                                wl::xdg_wm_base::Event::Ping { serial } => {
-                                    base.pong(serial);
-                                    Ok(())
-                                }
-                            }),
-                            version,
-                        ),
-                    ));
-                } else if interface.as_c_str() == wl::WlShm::NAME {
-                    let cb_shm_fmts = cb_shm_fmts.clone();
-                    gs.2.replace(reg.bind(
-                        name,
-                        (
-                            wl::WlShm::new(move |_, e| match e {
-                                wl::wl_shm::Event::Format { format } => {
-                                    cb_shm_fmts.borrow_mut().push(format);
-                                    Ok(())
-                                }
-                            }),
-                            version,
-                        ),
-                    ));
-                }
-                Ok(())
-            }
-            _ => Ok(()),
-        }));
+    use wl::InterfaceDesc;
+    let idata = cl.ids.new_resource(InitData::new([
+        (wl::WlCompositor::NAME, 0, 4, 4),
+        (wl::WlSeat::NAME, 0, 7, 7),
+        (wl::WlShm::NAME, 0, 1, 1),
+        (wl::ZwlrLayerShellV1::NAME, 0, 2, 5),
+    ]));
+    let reg = wl::WlRegistry::new(idata);
+    let reg = cl.display.get_registry(&cl.ids, reg);
 
     cl.sync();
-
-    let (compositor, wm_base, shm) = {
-        let mut gs = globals.borrow_mut();
+    let (compositor, seat, shm, layer_shell) = {
+        let gs = &cl.ids.resource(idata).versions;
+        let (mut compositor, mut seat, mut shm, mut layer_shell) = (None, None, None, None);
+        for (iface, name, version, _) in gs.iter().filter(|(_, n, _, _)| *n != 0) {
+            match *iface {
+                wl::WlCompositor::NAME => {
+                    compositor = Some(reg.bind(&cl.ids, *name, (wl::WlCompositor, *version)));
+                }
+                wl::WlSeat::NAME => {
+                    seat = Some(reg.bind(&cl.ids, *name, (wl::WlSeat::new(idata), *version)));
+                }
+                wl::WlShm::NAME => {
+                    shm = Some(reg.bind(&cl.ids, *name, (wl::WlShm::new(idata), *version)));
+                }
+                wl::ZwlrLayerShellV1::NAME => {
+                    layer_shell = Some(reg.bind(&cl.ids, *name, (wl::ZwlrLayerShellV1, *version)));
+                }
+                _ => {}
+            }
+        }
         (
-            gs.0.take().expect("compositor is required"),
-            gs.1.take().expect("wm_base is required"),
-            gs.2.take().expect("shm is required"),
+            compositor.expect("no suitable wl_compositor found"),
+            seat.expect("no suitable wl_seat found"),
+            shm.expect("no suitable wl_shm found"),
+            layer_shell.expect("no suitable zwlr_layer_shell found"),
         )
     };
 
-    if !shm_fmts.borrow().contains(&wl::wl_shm::Format::Argb8888) {
-        panic!("server must support arg8888");
-    }
+    cl.sync();
+    assert!(
+        cl.ids.resource(idata).shm_has_argb8888,
+        "server must support argb8888"
+    );
+    let pbuf = pixbuf::ShmPixelBuffer::new(&cl.ids, shm, 300, 200);
+    cl.ids.resource_mut(pbuf).clear(0xffff9900);
+    let app = cl.ids.new_resource(App::default());
 
-    let pbuf = pixbuf::ShmPixelBuffer::new(shm, 300, 200);
-
-    let wl_surface = compositor.create_surface(wl::WlSurface::new(|_, e| match e {
-        wl::wl_surface::Event::Enter { output } => Ok(()),
-        wl::wl_surface::Event::Leave { output } => Ok(()),
-    }));
-    let surface = wm_base.get_xdg_surface(
-        wl::XdgSurface::new(move |me, e| match e {
-            wl::xdg_surface::Event::Configure { serial, .. } => {
-                me.ack_configure(serial);
+    let pointer = seat.get_pointer(
+        &cl.ids,
+        wl::WlPointer::from_fn(move |_, ids, e| match e {
+            wl::wl_pointer::Event::Enter {
+                serial,
+                surface,
+                surface_x,
+                surface_y,
+            } => {
+                ids.resource_mut(pbuf).clear(0xffff9900);
+                ids.resource_mut(app).dirty = true;
+                Ok(())
+            }
+            wl::wl_pointer::Event::Leave { serial, surface } => {
+                ids.resource_mut(pbuf).clear(0xff444444);
+                ids.resource_mut(app).dirty = true;
+                Ok(())
+            }
+            _ => Ok(()),
+        }),
+    );
+    let wl_surface = compositor.create_surface(
+        &cl.ids,
+        wl::WlSurface::from_fn(move |_, ids, e| match e {
+            wl::wl_surface::Event::Enter { .. } => {
+                ids.resource_mut(pbuf).clear(0xffff9900);
+                ids.resource_mut(app).dirty = true;
+                Ok(())
+            }
+            wl::wl_surface::Event::Leave { .. } => {
+                ids.resource_mut(pbuf).clear(0xff444444);
+                ids.resource_mut(app).dirty = true;
+                Ok(())
+            }
+        }),
+    );
+    let layer_surface = layer_shell.get_layer_surface(
+        &cl.ids,
+        wl::ZwlrLayerSurfaceV1::from_fn(move |sh, ids, e| match e {
+            wl::zwlr_layer_surface_v1::Event::Configure { serial, .. } => {
+                ids.resource_mut(app).surface_configured = true;
+                sh.ack_configure(ids, serial);
+                Ok(())
+            }
+            wl::zwlr_layer_surface_v1::Event::Closed {} => {
+                ids.resource_mut(app).done = true;
                 Ok(())
             }
         }),
         wl_surface.clone(),
-    );
-
-    let pos = wm_base.create_positioner(wl::XdgPositioner::new(|_, e| match e {}));
-    pos.set_gravity(wl::xdg_positioner::Gravity::TopRight);
-    pos.set_size(100, 50);
-    pos.set_anchor_rect(0, 0, 100, 50);
-
-    let close = Rc::new(RefCell::new(false));
-    let cb_close = close.clone();
-    let popup = surface.get_popup(
-        wl::XdgPopup::new(move |_, e| match e {
-            wl::xdg_popup::Event::Configure { .. } => Ok(()),
-            wl::xdg_popup::Event::PopupDone {} => {
-                *cb_close.borrow_mut() = true;
-                Ok(())
-            }
-            wl::xdg_popup::Event::Repositioned { .. } => Ok(()),
-        }),
         None,
-        pos.clone(),
+        wl::zwlr_layer_shell_v1::Layer::Overlay,
+        wl::WlStr::from("ns"),
     );
-    wl_surface.commit();
+    layer_surface.set_size(&cl.ids, 300, 200);
+    wl_surface.commit(&cl.ids);
     cl.sync();
-    pos.destroy();
+    assert!(
+        cl.ids.resource(app).surface_configured,
+        "layer should have configured"
+    );
+    wl_surface.attach(&cl.ids, Some(pbuf.borrow(&cl.ids).wl.clone()), 0, 0);
+    wl_surface.commit(&cl.ids);
+    cl.sync();
 
-    while !*close.borrow() {
+    while !cl.ids.resource(app).done {
+        if cl.ids.resource(app).dirty {
+            wl_surface.commit(&cl.ids);
+        }
         cl.poll(true);
     }
 }
 
 mod pixbuf {
-    use super::{Rc, RefCell};
     use std::os::unix::io::RawFd;
 
     #[derive(Debug)]
@@ -216,33 +293,34 @@ mod pixbuf {
         (RawFd::from(tmpfd), shmbuf)
     }
 
+    impl wl::wl_buffer::EventHandler for ShmPixelBuffer {
+        fn on_release(&mut self, me: wl::WlRef<wl::WlBuffer>) -> Result<(), wl::WlHandleError> {
+            self.locked = false;
+            Ok(())
+        }
+    }
+
     impl ShmPixelBuffer {
         pub fn new(
+            ids: &wl::IdSpace,
             shm: wl::WlRef<wl::WlShm>,
             width: usize,
             height: usize,
-        ) -> Rc<RefCell<ShmPixelBuffer>> {
+        ) -> wl::IdResource<ShmPixelBuffer> {
             let (pfmt, psz) = (wl::wl_shm::Format::Argb8888, 4);
             let shmbuf_sz = psz * width * height;
             let (shmfd, shmbuf) = shmbuf(shmbuf_sz);
             let pool = shm.create_pool(
-                wl::WlShmPool::new(|_, e| match e {}),
+                ids,
+                wl::WlShmPool,
                 shmfd.into(),
                 shmbuf_sz.try_into().unwrap(),
             );
 
-            let ret = Rc::new_cyclic(|rc| {
-                let rc = rc.clone();
+            let ret = ids.new_resource_cyclic(|buf: wl::IdResource<ShmPixelBuffer>| {
                 let pool_buf = pool.create_buffer(
-                    wl::WlBuffer::new(move |_, e| match e {
-                        wl::wl_buffer::Event::Release {} => {
-                            let rc: Option<Rc<RefCell<ShmPixelBuffer>>> = rc.upgrade();
-                            if let Some(buf) = rc {
-                                buf.borrow_mut().locked = false;
-                            }
-                            Ok(())
-                        }
-                    }),
+                    ids,
+                    wl::WlBuffer::new(buf),
                     0,
                     width.try_into().unwrap(),
                     height.try_into().unwrap(),
@@ -250,17 +328,26 @@ mod pixbuf {
                     pfmt,
                 );
 
-                RefCell::new(ShmPixelBuffer {
+                let ret = ShmPixelBuffer {
                     wl: pool_buf,
                     locked: false,
                     width,
                     height,
                     addr: shmbuf as *mut u32,
-                })
+                };
+                ret
             });
-            pool.destroy();
+            pool.destroy(ids);
 
             ret
+        }
+
+        pub fn clear(&mut self, color: u32) {
+            for i in 0..(self.width * self.height) {
+                unsafe {
+                    *self.addr.offset(i.try_into().unwrap()).as_mut().unwrap() = color;
+                }
+            }
         }
     }
 }

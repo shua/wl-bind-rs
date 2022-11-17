@@ -283,6 +283,38 @@ fn gen_ser(
     });
 }
 
+fn gen_evtfn(
+    evt_fns: &mut Vec<TokenStream>,
+    evt_dispatch: &mut Vec<TokenStream>,
+    m: &Message,
+    name: &Ident,
+    iname: &Ident,
+    desc: &str,
+    arg_tys: &ArgTys,
+) {
+    let fnname = tok_id(&format!("on_{}", str_(&m.name)));
+    let fngen = if arg_tys.gen.is_empty() {
+        quote! {}
+    } else {
+        let gen_arg_ty = &arg_tys.gen;
+        quote! { <#gen_arg_ty> }
+    };
+
+    let req_arg_ty = &arg_tys.enm;
+    evt_fns.push(quote! {
+        #[doc = #desc]
+        fn #fnname #fngen (
+            &mut self,
+            me: WlRef<#iname>,
+            #req_arg_ty
+        ) -> Result<(), WlHandleError>
+    });
+    let enm_args = &arg_tys.enm.arg;
+    evt_dispatch.push(quote! {
+        Event::#name { #(#enm_args),* } => self.#fnname(me, #(#enm_args),*),
+    });
+}
+
 fn gen_reqfn(
     req_fns: &mut Vec<TokenStream>,
     m: &Message,
@@ -310,10 +342,10 @@ fn gen_reqfn(
         #[doc = #desc]
         pub fn #fnname #fngen (
             &self,
+            ids: &IdSpace,
             #req_arg_ty
         ) -> (#(#req_ret_ty),*)
         {
-            let ids = self.ids.upgrade().expect("ids unavailable");
             #(#req_new_id)*
             let req = Request::#name{ #(#args),* };
 
@@ -356,7 +388,7 @@ fn gen_enum(n: &Enum, enms: &mut Vec<TokenStream>, opts: GenOptions<'_>) {
             from_cases.push(quote! { #value => Ok(#name::#ename), });
         } else {
             let ename = tok_id(&ename.to_uppercase());
-            entries.push(quote! { const #ename : u32 = #value; });
+            entries.push(quote! { pub const #ename : u32 = #value; });
         }
     }
 
@@ -483,9 +515,18 @@ pub fn generate(p: &Protocol, options: GenOptions<'_>) -> TokenStream {
 
         let mut gen_events: Vec<TokenStream> = Vec::with_capacity(events.len());
         let mut dsr_cases: Vec<TokenStream> = Vec::with_capacity(events.len());
+        let mut evt_fns: Vec<TokenStream> = Vec::with_capacity(events.len());
+        let mut evt_dispatch: Vec<TokenStream> = Vec::with_capacity(events.len());
+        let mut evt_contains_ref = false;
         for v in events {
             let opname = gen_opname(v, &mut vops);
             let (name, mgen) = gen_message(&mut gen_events, v, opname);
+
+            evt_contains_ref = evt_contains_ref
+                || v.args
+                    .iter()
+                    .find(|a| a.r#type == b"object" || a.r#type == b"new_id")
+                    .is_some();
 
             gen_dsr(
                 &mut dsr_cases,
@@ -494,15 +535,31 @@ pub fn generate(p: &Protocol, options: GenOptions<'_>) -> TokenStream {
                 &mgen.arg_ty.enm.arg,
                 &mgen.dsr,
             );
+            gen_evtfn(
+                &mut evt_fns,
+                &mut evt_dispatch,
+                v,
+                &name,
+                &name_ty,
+                str_(&v.description),
+                &mgen.arg_ty,
+            );
         }
 
         let mut rops: Vec<TokenStream> = Vec::with_capacity(requests.len());
         let mut gen_requests: Vec<TokenStream> = Vec::with_capacity(requests.len());
         let mut ser_cases: Vec<TokenStream> = Vec::with_capacity(requests.len());
         let mut req_fns: Vec<TokenStream> = Vec::with_capacity(requests.len());
+        let mut req_contains_ref = false;
         for r in requests {
             let opname = gen_opname(r, &mut rops);
             let (name, mgen) = gen_message(&mut gen_requests, r, opname);
+
+            req_contains_ref = req_contains_ref
+                || r.args
+                    .iter()
+                    .find(|a| a.r#type == b"object" || a.r#type == b"new_id")
+                    .is_some();
 
             gen_ser(
                 &mut ser_cases,
@@ -543,17 +600,142 @@ pub fn generate(p: &Protocol, options: GenOptions<'_>) -> TokenStream {
             );
         }
 
-        let name_null = format!("{}\0", iname);
+        enms.push(quote! {
+            #[derive(Debug)]
+            pub enum Event { #(#gen_events)* }
+        });
+        enms.push(quote! {
+            #[derive(Debug)]
+            pub enum Request { #(#gen_requests)* }
+        });
+
+        let evt_handle_fn =
+            quote! { Fn(WlRef<#name_ty>, &IdSpace, Event) -> Result<(), WlHandleError> };
+        let evt_handler = if events.len() == 0 {
+            quote! {
+                pub struct #name_ty;
+                impl Interface for #name_ty {
+                    fn handle_event(
+                        &mut self,
+                        wr: std::rc::Weak<RefCell<BufStream>>,
+                        ids: &IdSpace,
+                        id: u32,
+                        buf: &mut [u8],
+                        fdbuf: &mut Vec<RawFd>,
+                    ) -> Result<(), WlHandleError> {
+                        Err(WlHandleError::Unhandled)
+                    }
+
+                    fn type_id(&self) -> std::any::TypeId {
+                        std::any::TypeId::of::<#name_ty>()
+                    }
+                    fn name(&self) -> &'static str {
+                        #name_ty::NAME
+                    }
+                    fn version(&self) -> u32 {
+                        #name_ty::VERSION
+                    }
+                }
+            }
+        } else {
+            quote! {
+                /**
+                 * Implementors of EventHandler should override the on_* methods
+                 */
+                pub trait EventHandler {
+                    /// This is the main entrypoint for events, by default it dispatches on the
+                    /// trait's other methods. Implementors of EventHandler should probably not
+                    /// override this method.
+                    fn handle_event(
+                        &mut self,
+                        me: WlRef<#name_ty>,
+                        ids: &IdSpace,
+                        ev: Event,
+                    ) -> Result<(), WlHandleError> {
+                        match ev {
+                            #(#evt_dispatch)*
+                            _ => Err(WlHandleError::Unhandled),
+                        }
+                    }
+
+                    #(#evt_fns { Err(WlHandleError::Unhandled) })*
+                }
+
+                struct FnEventHandler<F>(F) ;
+                impl <F: #evt_handle_fn> EventHandler for FnEventHandler<F> {
+                    fn handle_event(
+                        &mut self,
+                        me: WlRef<#name_ty>,
+                        ids: &IdSpace,
+                        ev: Event,
+                    ) -> Result<(), WlHandleError> {
+                        (self.0)(me, ids, ev)
+                    }
+                }
+
+                impl <EH: EventHandler + 'static> EventHandler for IdResource<EH> {
+                    fn handle_event(
+                        &mut self,
+                        me: WlRef<#name_ty>,
+                        ids: &IdSpace,
+                        ev: Event,
+                    ) -> Result<(), WlHandleError> {
+                        ids.with_mut_resource(self, |res: &mut EH| res.handle_event(me, ids, ev))
+                            .expect("resource doesn't exist")
+                    }
+                }
+
+                pub struct #name_ty(Box<dyn EventHandler>);
+
+                impl #name_ty {
+                    pub fn new(handler: impl EventHandler + 'static) -> #name_ty {
+                        #name_ty (Box::new(handler))
+                    }
+                    pub fn from_fn(on_event: impl #evt_handle_fn + 'static) -> #name_ty {
+                        #name_ty (Box::new(FnEventHandler(on_event)))
+                    }
+
+                }
+
+                impl Interface for #name_ty {
+                    fn handle_event(
+                        &mut self,
+                        wr: std::rc::Weak<RefCell<BufStream>>,
+                        ids: &IdSpace,
+                        id: u32,
+                        buf: &mut [u8],
+                        fdbuf: &mut Vec<RawFd>,
+                    ) -> Result<(), WlHandleError> {
+                        let (event, _) = Event::dsr(ids, &wr, buf, fdbuf)
+                            .map_err(WlHandleError::Deser)?;
+                        if wayland_debug_enabled() {
+                            println!("[{}] {}@{id} <- {event:?}", timestamp(), self.name());
+                        }
+                        let me =
+                            WlClient::static_make_ref(ids, wr, id).unwrap();
+                        self.0.handle_event(me, ids, event)
+                    }
+
+                    fn type_id(&self) -> std::any::TypeId {
+                        std::any::TypeId::of::<#name_ty>()
+                    }
+
+                    fn name(&self) -> &'static str {
+                        #name_ty::NAME
+                    }
+                    fn version(&self) -> u32 {
+                        #name_ty::VERSION
+                    }
+                }
+            }
+        };
+
         ifaces.push(quote! {
             #[doc = #idoc]
             pub mod #modname {
                 use super::*;
 
                 #(#enms)*
-                #[derive(Debug)]
-                pub enum Event { #(#gen_events)* }
-                #[derive(Debug)]
-                pub enum Request { #(#gen_requests)* }
 
                 struct OpCode;
                 impl OpCode {
@@ -561,48 +743,12 @@ pub fn generate(p: &Protocol, options: GenOptions<'_>) -> TokenStream {
                     #(#rops)*
                 }
 
-                pub struct #name_ty (
-                    Box<dyn FnMut(WlRef<#name_ty>, Event) -> Result<(), WlHandleError>>,
-                );
-
-                impl #name_ty {
-                    pub fn new(on_event: impl FnMut(WlRef<#name_ty>, Event) -> Result<(), WlHandleError> + 'static) -> #name_ty {
-                        #name_ty(Box::new(on_event))
-                    }
-                }
-
                 impl InterfaceDesc for #name_ty {
-                    type Request = Request;
-                    type Event = Event;
-                    const NAME: &'static std::ffi::CStr = unsafe { std::ffi::CStr::from_bytes_with_nul_unchecked(#name_null.as_bytes()) };
+                    const NAME: &'static str = #iname ;
                     const VERSION: u32 = #iversion;
                 }
 
-                impl Interface for #name_ty {
-                    fn handle_event(&mut self, cl: &WlClient, id: u32, buf: &mut [u8], fdbuf: &mut Vec<RawFd>) -> Result<(), WlHandleError> {
-                        let wr = Rc::downgrade(&cl.write);
-                        let (event, _) = Event::dsr(&cl.ids, &wr, buf, fdbuf)
-                            .map_err(WlHandleError::Deser)?;
-                        if wayland_debug_enabled() {
-                            println!("[{}] {}@{id} <- {event:?}", timestamp(), self.name().to_str().unwrap());
-                        }
-                        (self.0)(
-                            WlClient::static_make_ref(&cl.ids, wr, id).unwrap(),
-                            event,
-                        )
-                    }
-
-                    fn type_id(&self) -> std::any::TypeId {
-                        std::any::TypeId::of::<#name_ty>()
-                    }
-
-                    fn name(&self) -> &'static std::ffi::CStr {
-                        #name_ty::NAME
-                    }
-                    fn version(&self) -> u32 {
-                        #name_ty::VERSION
-                    }
-                }
+                #evt_handler
 
                 impl WlRef<#name_ty> { #(#req_fns)* }
 

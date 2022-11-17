@@ -38,6 +38,7 @@ fn main() {
     let mut used: Vec<(Vec<u8>, Vec<u8>)> = vec![];
     let protoc_rs = parse_protoc(wayland_xml, &mut used);
     write!(dst_file, "{}", prettyplease::unparse(&protoc_rs)).unwrap();
+    eprintln!("processed {wayland_xml}");
     println!("cargo:rerun-if-changed={wayland_xml}");
 
     let protoc_dir = "/usr/share/wayland-protocols";
@@ -48,6 +49,7 @@ fn main() {
                 let f = f.unwrap();
                 let protoc_rs = parse_protoc(f.path(), &mut used);
                 write!(dst_file, "{}", prettyplease::unparse(&protoc_rs)).unwrap();
+                eprintln!("processed {:?}", f.path());
             }
         }
     }
@@ -59,8 +61,17 @@ fn main() {
         println!("cargo:rerun-if-changed={path}");
         for f in fs::read_dir(path).unwrap() {
             let f = f.unwrap();
-            let protoc_rs = parse_protoc(f.path(), &mut used);
-            write!(dst_file, "{}", prettyplease::unparse(&protoc_rs)).unwrap();
+            if let Some(ext) = f.path().extension() {
+                if ext == "xml" {
+                    let protoc_rs = parse_protoc(f.path(), &mut used);
+                    write!(dst_file, "{}", prettyplease::unparse(&protoc_rs)).unwrap();
+                    eprintln!("processed {:?}", f.path());
+                } else {
+                    eprintln!("skipped {:?}", f.path());
+                }
+            } else {
+                eprintln!("skipped {:?}", f.path());
+            }
         }
     }
 }

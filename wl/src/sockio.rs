@@ -1,9 +1,104 @@
+use crate::{WlSer, WlSerError};
 use std::os::unix::{io::AsRawFd, io::RawFd, net::UnixStream};
 
 const FDBUF_MAX: usize =
     unsafe { libc::CMSG_SPACE((253 * std::mem::size_of::<RawFd>()) as u32) as usize };
 
-pub fn recvmsg(
+const WORD_SZ: usize = std::mem::size_of::<u32>();
+const HDR_SZ: usize = WORD_SZ * 2;
+
+pub struct BufStream {
+    pub sock: UnixStream,
+    buf: Vec<u8>,
+    fdbuf: Vec<RawFd>,
+}
+
+pub struct BufStreamMessage<'buf> {
+    buf: &'buf mut Vec<u8>,
+    fdbuf: &'buf mut Vec<RawFd>,
+    pub id: u32,
+    pub op: u16,
+    sz: usize,
+}
+
+impl BufStreamMessage<'_> {
+    pub fn bufs(&mut self) -> (&mut [u8], &mut Vec<RawFd>) {
+        (&mut self.buf[..self.sz], &mut self.fdbuf)
+    }
+}
+
+impl Drop for BufStreamMessage<'_> {
+    fn drop(&mut self) {
+        // move unhandled bytes to front of buf, truncate
+        self.buf.copy_within(self.sz.., 0);
+        self.buf.truncate(self.buf.len() - self.sz);
+    }
+}
+
+impl BufStream {
+    pub fn new(sock: UnixStream) -> BufStream {
+        BufStream {
+            sock,
+            buf: Vec::with_capacity(1024),
+            fdbuf: Vec::with_capacity(4),
+        }
+    }
+
+    pub fn recv(&mut self) -> Option<BufStreamMessage> {
+        if self.buf.len() < HDR_SZ {
+            let (bufn, fdbufn) =
+                recvmsg(&mut self.sock, &mut self.buf, &mut self.fdbuf).expect("recvmsg");
+            if bufn == 0 && fdbufn == 0 {
+                return None;
+            }
+        }
+        if self.buf.len() < HDR_SZ {
+            eprintln!("buf len < HDR_SZ {} {HDR_SZ}", self.buf.len());
+            return None;
+        }
+
+        let id = u32::from_ne_bytes(self.buf[..WORD_SZ].try_into().unwrap());
+        let (sz, op): (usize, u16) = {
+            let szop = u32::from_ne_bytes(self.buf[WORD_SZ..HDR_SZ].try_into().unwrap());
+            (
+                (szop >> 16).try_into().unwrap(),
+                (szop & 0xffff).try_into().unwrap(),
+            )
+        };
+
+        if self.buf.len() < sz {
+            recvmsg(&mut self.sock, &mut self.buf, &mut self.fdbuf).expect("recvmsg");
+            if self.buf.len() < sz {
+                return None;
+            }
+        }
+
+        Some(BufStreamMessage {
+            buf: &mut self.buf,
+            fdbuf: &mut self.fdbuf,
+            id,
+            op,
+            sz,
+        })
+    }
+
+    pub fn send<T: WlSer>(&mut self, id: u32, val: T) -> Result<(), WlSerError> {
+        self.buf.truncate(0);
+        self.buf.extend(id.to_ne_bytes());
+        val.ser(&mut self.buf, &mut self.fdbuf)?;
+        let n = sendmsg(&mut self.sock, &self.buf, &self.fdbuf);
+        self.buf.truncate(0);
+        self.fdbuf.truncate(0);
+        if n < self.buf.len() {
+            // not even sure we can retry the message here?
+            // TODO: check wayland docs for what we can do on socket errors
+            panic!("buffer underwrite");
+        }
+        Ok(())
+    }
+}
+
+fn recvmsg(
     sock: &mut UnixStream,
     buf: &mut Vec<u8>,
     fdbuf: &mut Vec<RawFd>,
@@ -102,7 +197,7 @@ pub fn recvmsg(
     Ok((n.try_into().unwrap(), fdbuf_extend))
 }
 
-pub fn sendmsg(sock: &mut UnixStream, buf: &[u8], fds: &[RawFd]) -> usize {
+fn sendmsg(sock: &mut UnixStream, buf: &[u8], fds: &[RawFd]) -> usize {
     let mut msg_control: [u8; FDBUF_MAX] = [0; FDBUF_MAX];
     let cmsg_inner_len = fds.len() * std::mem::size_of::<RawFd>();
 

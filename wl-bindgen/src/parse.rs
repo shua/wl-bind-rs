@@ -166,7 +166,7 @@ pub fn parse(xml: &[u8]) -> Result<Protocol, ParseError> {
         EnumEntryDescription as SNED, Interface as SI, InterfaceDescription as SID, Message as SM,
         MessageDescription as SMD, Protocol as SP, ProtocolDescription as SPD, Start as SS,
     };
-    use XEvent::{Empty, End, Eof, Start, Text};
+    use XEvent::{CData, Empty, End, Eof, Start, Text};
 
     let mut rdr = Reader::from_str(str_(xml));
     let mut buf = vec![];
@@ -225,6 +225,11 @@ pub fn parse(xml: &[u8]) -> Result<Protocol, ParseError> {
             },
 
             (SC(mut p), Text(txt)) => {
+                p.copyright.extend(b"\n");
+                p.copyright.extend(txt.as_ref());
+                SC(p)
+            }
+            (SC(mut p), CData(txt)) => {
                 p.copyright.extend(b"\n");
                 p.copyright.extend(txt.as_ref());
                 SC(p)
