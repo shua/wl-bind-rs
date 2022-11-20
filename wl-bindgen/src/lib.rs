@@ -4,6 +4,7 @@ mod parse;
 pub use parse::parse;
 mod generate;
 pub use generate::{generate, GenOptions};
+pub mod generate2;
 
 fn str_<'s, S: ?Sized + AsRef<[u8]> + 's>(bs: &'s S) -> &'s str {
     unsafe { std::str::from_utf8_unchecked(bs.as_ref()) }

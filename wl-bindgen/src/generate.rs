@@ -159,9 +159,9 @@ impl quote::ToTokens for ArgTy {
     fn to_tokens(&self, tokens: &mut TokenStream) {
         use quote::TokenStreamExt;
         for i in 0..self.arg.len() {
-            tokens.append(self.arg[i].clone());
-            tokens.append(proc_macro2::Punct::new(':', proc_macro2::Spacing::Alone));
-            tokens.append_all(self.ty[i].clone());
+            let arg = &self.arg[i];
+            let ty = &self.ty[i];
+            tokens.extend(quote! { #arg : #ty });
             if i != self.arg.len() {
                 tokens.append(proc_macro2::Punct::new(',', proc_macro2::Spacing::Alone));
             }
