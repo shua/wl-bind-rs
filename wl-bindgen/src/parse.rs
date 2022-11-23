@@ -42,6 +42,17 @@ pub enum ParseError {
     XML(quick_xml::Error),
     Unexpected(State, String),
 }
+impl std::fmt::Display for ParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ParseError::XML(err) => write!(f, "{err}"),
+            ParseError::Unexpected(state, expected) => {
+                write!(f, "expected {expected:?} at {state:?}")
+            }
+        }
+    }
+}
+impl std::error::Error for ParseError {}
 
 impl ParseError {
     fn new<S: ?Sized + AsRef<[u8]>>(st: State, expected: &str, got: &S) -> ParseError {

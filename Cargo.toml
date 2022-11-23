@@ -2,5 +2,5 @@
 members = [
 	"example",
 	"wl-bindgen",
-	"wl-macro",
+	"wl-scanner",
 ]
