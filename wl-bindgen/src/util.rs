@@ -1,8 +1,7 @@
-#![allow(unused)]
-
 use std::mem::MaybeUninit;
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
+use std::sync::Arc;
 
 fn cerrstr<T: From<i8> + PartialOrd>(ret: T) -> Result<T, String> {
     // try to read errno as early as possible
@@ -145,4 +144,79 @@ fn shm_open(name: &str) -> Result<RawFd, String> {
     };
     let fd = cerrstr(unsafe { libc::shm_open(name.as_ptr().cast(), libc::O_RDWR) })?;
     Ok(fd)
+}
+
+struct Conn {}
+type Fd = std::os::fd::RawFd;
+struct Fixed(u32);
+
+struct Serializer {}
+enum SerError {}
+type SerResult = Result<(), SerError>;
+trait Ser {
+    fn ser(&self, s: &mut Serializer) -> SerResult;
+}
+impl Serializer {
+    pub fn write_int(&mut self, val: i32) -> SerResult {
+        todo!()
+    }
+    pub fn write_uint(&mut self, val: u32) -> SerResult {
+        todo!()
+    }
+    pub fn write_string(&mut self, val: &str) -> SerResult {
+        todo!()
+    }
+    pub fn write_array(&mut self, val: &[u8]) -> SerResult {
+        todo!()
+    }
+    pub fn write_fd(&mut self, val: Fd) -> SerResult {
+        todo!()
+    }
+    pub fn write_any(&mut self, val: &dyn Ser) -> SerResult {
+        val.ser(self)
+    }
+}
+
+struct Deserializer<'dsr, Ctx> {
+    data: &'dsr [u8],
+    pub ctx: Ctx,
+}
+enum DsrError {}
+type DsrResult<T> = Result<T, DsrError>;
+trait Dsr<'dsr>: Sized + 'dsr {
+    type Context: ?Sized;
+    fn dsr<Ctx: AsRef<Self::Context>>(s: &mut Deserializer<'dsr, Ctx>) -> DsrResult<Self>;
+}
+impl<'dsr, Ctx> Deserializer<'dsr, Ctx> {
+    pub fn read_int(&mut self) -> DsrResult<i32> {
+        todo!()
+    }
+    pub fn read_uint(&mut self) -> DsrResult<u32> {
+        todo!()
+    }
+    pub fn read_string(&mut self) -> DsrResult<&'dsr str> {
+        todo!()
+    }
+    pub fn read_array(&mut self) -> DsrResult<&'dsr [u8]> {
+        todo!()
+    }
+    pub fn read_fd(&mut self) -> DsrResult<Fd> {
+        todo!()
+    }
+    pub fn read_any<T: Dsr<'dsr>>(&mut self) -> DsrResult<T>
+    where
+        Ctx: AsRef<T::Context>,
+    {
+        T::dsr(self)
+    }
+}
+
+struct MessageContext {
+    conn: Arc<Conn>,
+    op: u16,
+}
+impl AsRef<Arc<Conn>> for MessageContext {
+    fn as_ref(&self) -> &Arc<Conn> {
+        &self.conn
+    }
 }
