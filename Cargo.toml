@@ -1,6 +1,19 @@
-[workspace]
-members = [
-	"wl-bindgen",
-	"wl",
+workspace.members = [
 	"wl-example",
 ]
+
+[package]
+name = "wl-bind"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+path = "./gen.rs"
+name = "gen"
+
+
+[dependencies]
+anyhow = "1.0.75"
+libc = "0.2.150"
+quick-xml = "0.31.0"
+
